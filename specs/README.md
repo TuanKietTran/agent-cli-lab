@@ -10,6 +10,6 @@ Specs are ordered by filename. Work on the lowest-numbered unfinished spec first
 | Evidence | [003-pi-tui-smoke-test.md](003-pi-tui-smoke-test.md) | Passed |
 | P0 | [004-headless-interactive-control.md](004-headless-interactive-control.md) | Complete |
 | Ops | [005-local-lifecycle.md](005-local-lifecycle.md) | Verified (Linux in Docker, Windows native) |
-| P0 | [006-cross-platform.md](006-cross-platform.md) | Verified on Windows (GNU), Linux (Docker) and macOS (CI); Windows-MSVC awaits a CI re-run |
+| P0 | [006-cross-platform.md](006-cross-platform.md) | Verified on Windows (GNU locally, MSVC in CI), Linux (Docker and CI) and macOS (CI) |
 
 A spec is complete only when all acceptance criteria are covered by automated tests or explicitly marked as manual checks.

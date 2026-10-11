@@ -1,6 +1,6 @@
 # Local lifecycle: setup / run / teardown
 
-Linux was verified by hand on 2026-10-10 from a Windows host with Docker (Rancher Desktop), image `rust:1-slim` (Rust 1.99, Linux x86_64), **before** the cross-platform work of spec 006. After it, Linux was verified again on 2026-10-11 with the automated suite at commit `ab2cf4a` (10 unit tests and 7 integration tests passed, read-only mount, the WSL2 kernel of Rancher Desktop), and native Windows (Rust 1.99, GNU toolchain) was verified on 2026-10-11. macOS was verified only by CI (`macos-latest`, 10 unit and 7 integration tests passed, 2026-10-11). CI on Windows with the MSVC toolchain ran the unit tests only, with 1 test-only failure that is fixed but not yet re-run (spec 006), so MSVC is not yet verified.
+Linux was verified by hand on 2026-10-10 from a Windows host with Docker (Rancher Desktop), image `rust:1-slim` (Rust 1.99, Linux x86_64), **before** the cross-platform work of spec 006. After it, on 2026-10-11, the automated suite passed on Linux in Docker at commit `ab2cf4a` (10 unit and 7 integration tests, read-only mount, the WSL2 kernel of Rancher Desktop) and on native Windows with the GNU toolchain. GitHub Actions at commit `979a72b` (run 38124801783) then ran the suite on `ubuntu-latest` (10 unit and 7 integration tests), `macos-latest` (10 and 7) and `windows-latest` with the MSVC toolchain (13 and 7); all three passed. Not run by hand: macOS, and the MSVC toolchain locally.
 
 ## Platform
 
