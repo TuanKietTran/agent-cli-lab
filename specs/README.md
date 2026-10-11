@@ -10,5 +10,6 @@ Specs are ordered by filename. Work on the lowest-numbered unfinished spec first
 | Evidence | [003-pi-tui-smoke-test.md](003-pi-tui-smoke-test.md) | Passed |
 | P0 | [004-headless-interactive-control.md](004-headless-interactive-control.md) | Complete |
 | Ops | [005-local-lifecycle.md](005-local-lifecycle.md) | Verified (Docker) |
+| P0 | [006-cross-platform.md](006-cross-platform.md) | In progress |
 
 A spec is complete only when all acceptance criteria are covered by automated tests or explicitly marked as manual checks.
