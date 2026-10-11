@@ -1,11 +1,10 @@
+mod conpty;
+mod ipc;
+
 use std::{
     ffi::OsString,
     fs::File,
     io::{self, BufRead, BufReader, IsTerminal, Read, Write},
-    os::unix::{
-        fs::PermissionsExt,
-        net::{UnixListener, UnixStream},
-    },
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -17,9 +16,18 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Args, Parser, Subcommand};
-use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+
+type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
+
+/// What `run` sends to the child when its piped stdin ends: Ctrl-D on a Unix terminal. A Windows
+/// console ignores Ctrl-D; it ends input on Ctrl-Z followed by Enter.
+#[cfg(not(windows))]
+const END_OF_INPUT: &[u8] = &[0x04];
+#[cfg(windows)]
+const END_OF_INPUT: &[u8] = &[0x1a, 0x0d];
 
 #[derive(Debug, Parser)]
 #[command(
@@ -58,7 +66,8 @@ struct RunArgs {
 struct HostArgs {
     #[command(flatten)]
     terminal: TerminalArgs,
-    /// Unix socket used by `send` and `screen`.
+    /// Local socket used by `send` and `screen`. On Windows this is only a name: it is mapped to
+    /// a named pipe that just the current user can open, and no file is created.
     #[arg(long, value_name = "PATH")]
     socket: PathBuf,
     /// Also display the TUI and accept keyboard input in this terminal.
@@ -84,7 +93,7 @@ struct TerminalArgs {
 
 #[derive(Debug, Args)]
 struct SocketArgs {
-    /// Unix socket of the running host.
+    /// Local socket of the running host (the same value that was given to `host`).
     #[arg(long, value_name = "PATH")]
     socket: PathBuf,
 }
@@ -146,14 +155,16 @@ fn create_recorder(
     Ok(recorder)
 }
 
-fn open_pty(
-    args: &TerminalArgs,
-    child_command: &[OsString],
-) -> Result<(
-    Box<dyn portable_pty::Child + Send + Sync>,
-    Box<dyn Read + Send>,
-    Box<dyn Write + Send>,
-)> {
+struct Pty {
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    reader: Box<dyn Read + Send>,
+    writer: SharedWriter,
+    /// Must stay alive until the child has exited: on Windows, dropping it closes the
+    /// pseudo-console and kills the child.
+    master: Box<dyn MasterPty + Send>,
+}
+
+fn open_pty(args: &TerminalArgs, child_command: &[OsString]) -> Result<Pty> {
     let pair = native_pty_system()
         .openpty(PtySize {
             rows: args.rows,
@@ -180,16 +191,23 @@ fn open_pty(
         .master
         .take_writer()
         .context("failed to open PTY input")?;
-    Ok((child, reader, writer))
+    Ok(Pty {
+        child,
+        reader,
+        writer: Arc::new(Mutex::new(writer)),
+        master: pair.master,
+    })
 }
 
 fn run(args: RunArgs) -> Result<i32> {
     validate_terminal(&args.terminal)?;
     let recorder = create_recorder(&args.terminal, &args.command)?;
-    let (mut child, mut reader, mut writer) = open_pty(&args.terminal, &args.command)?;
+    let pty = open_pty(&args.terminal, &args.command)?;
+    let writer = pty.writer.clone();
 
     let stdin_is_terminal = io::stdin().is_terminal();
     let _raw_mode = RawModeGuard::new(stdin_is_terminal)?;
+    let _console = conpty::ConsoleModes::enable(stdin_is_terminal, io::stdout().is_terminal());
     let input_recorder = recorder.clone();
     thread::spawn(move || {
         let mut stdin = io::stdin().lock();
@@ -202,18 +220,20 @@ fn run(args: RunArgs) -> Result<i32> {
             if let Some(recorder) = &input_recorder {
                 let _ = recorder.lock().unwrap().chunk("input", &buffer[..count]);
             }
-            if writer.write_all(&buffer[..count]).is_err() || writer.flush().is_err() {
+            let mut output = writer.lock().unwrap();
+            if output.write_all(&buffer[..count]).is_err() || output.flush().is_err() {
                 return;
             }
         }
         if !stdin_is_terminal {
-            let _ = writer.write_all(&[0x04]);
-            let _ = writer.flush();
+            let mut output = writer.lock().unwrap();
+            let _ = output.write_all(END_OF_INPUT);
+            let _ = output.flush();
         }
     });
 
     let mut stdout = io::stdout().lock();
-    copy_output(&mut reader, |bytes| {
+    let code = pty.pump(|bytes| {
         stdout.write_all(bytes)?;
         stdout.flush()?;
         if let Some(recorder) = &recorder {
@@ -221,22 +241,21 @@ fn run(args: RunArgs) -> Result<i32> {
         }
         Ok(())
     })?;
-    finish_child(&mut *child, recorder)
+    record_exit(recorder, code)
 }
 
 fn host(args: HostArgs) -> Result<i32> {
     validate_terminal(&args.terminal)?;
     let recorder = create_recorder(&args.terminal, &args.command)?;
-    let (mut child, mut reader, writer) = open_pty(&args.terminal, &args.command)?;
-    let writer = Arc::new(Mutex::new(writer));
+    let pty = open_pty(&args.terminal, &args.command)?;
+    let writer = pty.writer.clone();
     let parser = Arc::new(Mutex::new(vt100::Parser::new(
         args.terminal.rows,
         args.terminal.cols,
         0,
     )));
     let stopped = Arc::new(AtomicBool::new(false));
-    let socket_guard = SocketGuard::bind(&args.socket)?;
-    let listener = socket_guard.listener.try_clone()?;
+    let listener = ipc::bind(&args.socket)?;
     let listener_writer = writer.clone();
     let listener_parser = parser.clone();
     let listener_recorder = recorder.clone();
@@ -275,8 +294,13 @@ fn host(args: HostArgs) -> Result<i32> {
         });
     }
 
+    let _console = conpty::ConsoleModes::enable(
+        args.stdio && stdin_is_terminal,
+        args.stdio && io::stdout().is_terminal(),
+    );
+
     let mut stdout = io::stdout().lock();
-    copy_output(&mut reader, |bytes| {
+    let code = pty.pump(|bytes| {
         parser.lock().unwrap().process(bytes);
         if args.stdio {
             stdout.write_all(bytes)?;
@@ -288,11 +312,63 @@ fn host(args: HostArgs) -> Result<i32> {
         Ok(())
     })?;
 
-    let code = finish_child(&mut *child, recorder)?;
+    let code = record_exit(recorder, code)?;
     stopped.store(true, Ordering::Release);
     let _ = listener_thread.join();
-    drop(socket_guard);
     Ok(code)
+}
+
+impl Pty {
+    /// Passes the child's output to `consume` until it ends, then reaps the child and returns its
+    /// exit code.
+    fn pump(self, mut consume: impl FnMut(&[u8]) -> Result<()>) -> Result<i32> {
+        let Pty {
+            mut child,
+            mut reader,
+            writer,
+            master,
+        } = self;
+        let mut handshake = conpty::HandshakeFilter::default();
+        let mut consume = |bytes: &[u8]| -> Result<()> {
+            if !cfg!(windows) {
+                return consume(bytes);
+            }
+            let (bytes, reply) = handshake.filter(bytes);
+            if reply {
+                let mut input = writer.lock().unwrap();
+                input.write_all(conpty::CURSOR_REPLY)?;
+                input.flush()?;
+            }
+            if bytes.is_empty() {
+                return Ok(());
+            }
+            consume(&bytes)
+        };
+
+        // Windows: the output only ends once the pseudo-console is closed, which also kills the
+        // child, so it is closed from here as soon as the child has exited.
+        #[cfg(windows)]
+        let status = {
+            let waiter = thread::spawn(move || {
+                let status = child.wait();
+                drop(master);
+                status
+            });
+            copy_output(&mut reader, &mut consume)?;
+            waiter
+                .join()
+                .map_err(|_| anyhow!("child wait thread panicked"))?
+        };
+        #[cfg(not(windows))]
+        let status = {
+            copy_output(&mut reader, &mut consume)?;
+            let status = child.wait();
+            drop(master);
+            status
+        };
+        let status = status.context("failed to wait for child command")?;
+        Ok(status.exit_code() as i32)
+    }
 }
 
 fn copy_output(reader: &mut dyn Read, mut consume: impl FnMut(&[u8]) -> Result<()>) -> Result<()> {
@@ -308,12 +384,7 @@ fn copy_output(reader: &mut dyn Read, mut consume: impl FnMut(&[u8]) -> Result<(
     Ok(())
 }
 
-fn finish_child(
-    child: &mut dyn portable_pty::Child,
-    recorder: Option<Arc<Mutex<Recorder>>>,
-) -> Result<i32> {
-    let status = child.wait().context("failed to wait for child command")?;
-    let code = status.exit_code() as i32;
+fn record_exit(recorder: Option<Arc<Mutex<Recorder>>>, code: i32) -> Result<i32> {
     if let Some(recorder) = &recorder {
         recorder
             .lock()
@@ -340,16 +411,15 @@ struct ControlResponse {
 }
 
 fn serve_socket(
-    listener: UnixListener,
-    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    listener: ipc::Listener,
+    writer: SharedWriter,
     parser: Arc<Mutex<vt100::Parser>>,
     recorder: Option<Arc<Mutex<Recorder>>>,
     stopped: Arc<AtomicBool>,
 ) {
-    let _ = listener.set_nonblocking(true);
     while !stopped.load(Ordering::Acquire) {
-        match listener.accept() {
-            Ok((stream, _)) => {
+        match ipc::accept(&listener) {
+            Ok(stream) => {
                 let _ = handle_control(stream, &writer, &parser, &recorder);
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -361,13 +431,13 @@ fn serve_socket(
 }
 
 fn handle_control(
-    mut stream: UnixStream,
-    writer: &Arc<Mutex<Box<dyn Write + Send>>>,
+    stream: ipc::Stream,
+    writer: &SharedWriter,
     parser: &Arc<Mutex<vt100::Parser>>,
     recorder: &Option<Arc<Mutex<Recorder>>>,
 ) -> Result<()> {
     let mut line = String::new();
-    BufReader::new(stream.try_clone()?).read_line(&mut line)?;
+    BufReader::new(&stream).read_line(&mut line)?;
     let response = match serde_json::from_str::<ControlRequest>(&line) {
         Ok(request) if request.op == "send" => {
             let result = (|| -> Result<()> {
@@ -408,8 +478,9 @@ fn handle_control(
             error: Some(format!("invalid request: {error}")),
         },
     };
-    serde_json::to_writer(&mut stream, &response)?;
-    stream.write_all(b"\n")?;
+    let mut reply = serde_json::to_vec(&response)?;
+    reply.push(b'\n');
+    (&stream).write_all(&reply)?;
     Ok(())
 }
 
@@ -440,13 +511,14 @@ fn screen(args: SocketArgs) -> Result<i32> {
 }
 
 fn request(socket: &Path, value: Value) -> Result<Value> {
-    let mut stream = UnixStream::connect(socket)
+    let stream = ipc::connect(socket)
         .with_context(|| format!("failed to connect to {}", socket.display()))?;
-    serde_json::to_writer(&mut stream, &value)?;
-    stream.write_all(b"\n")?;
-    stream.flush()?;
+    let mut message = serde_json::to_vec(&value)?;
+    message.push(b'\n');
+    (&stream).write_all(&message)?;
+    (&stream).flush()?;
     let mut line = String::new();
-    BufReader::new(stream).read_line(&mut line)?;
+    BufReader::new(&stream).read_line(&mut line)?;
     let response: Value = serde_json::from_str(&line).context("invalid host response")?;
     if !response.get("ok").and_then(Value::as_bool).unwrap_or(false) {
         return Err(anyhow!(
@@ -458,29 +530,6 @@ fn request(socket: &Path, value: Value) -> Result<Value> {
         ));
     }
     Ok(response)
-}
-
-struct SocketGuard {
-    path: PathBuf,
-    listener: UnixListener,
-}
-
-impl SocketGuard {
-    fn bind(path: &Path) -> Result<Self> {
-        let listener = UnixListener::bind(path)
-            .with_context(|| format!("failed to bind socket {}", path.display()))?;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-        Ok(Self {
-            path: path.to_owned(),
-            listener,
-        })
-    }
-}
-
-impl Drop for SocketGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
 }
 
 struct RawModeGuard(bool);
