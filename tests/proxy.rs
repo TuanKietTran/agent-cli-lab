@@ -189,6 +189,16 @@ fn piped_input_reaches_child_and_eof_terminates_it() {
     assert!(String::from_utf8_lossy(&output.stdout).contains("agent input"));
 }
 
+/// Without a final newline the end-of-input key alone only completes the line, so the proxy has
+/// to send one more to end the child (on Unix this is the writer's final newline and end-of-file).
+#[test]
+fn piped_input_without_a_final_newline_still_ends_the_child() {
+    let output = run_proxy(&["run"], os::UNTIL_END_OF_INPUT, Some(b"agent input"));
+
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("agent input"));
+}
+
 #[test]
 fn separate_calls_can_control_and_capture_a_hosted_tui() {
     let mut host = Host::start(os::TWO_LINES);

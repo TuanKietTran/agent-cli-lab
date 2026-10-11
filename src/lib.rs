@@ -158,13 +158,14 @@ fn create_recorder(
 struct Pty {
     child: Box<dyn portable_pty::Child + Send + Sync>,
     reader: Box<dyn Read + Send>,
-    writer: SharedWriter,
     /// Must stay alive until the child has exited: on Windows, dropping it closes the
     /// pseudo-console and kills the child.
     master: Box<dyn MasterPty + Send>,
 }
 
-fn open_pty(args: &TerminalArgs, child_command: &[OsString]) -> Result<Pty> {
+/// The PTY and the writer for its input. Dropping the last reference to the writer makes it send
+/// a final newline and end-of-file to the child, so the caller decides who owns it.
+fn open_pty(args: &TerminalArgs, child_command: &[OsString]) -> Result<(Pty, SharedWriter)> {
     let pair = native_pty_system()
         .openpty(PtySize {
             rows: args.rows,
@@ -191,19 +192,19 @@ fn open_pty(args: &TerminalArgs, child_command: &[OsString]) -> Result<Pty> {
         .master
         .take_writer()
         .context("failed to open PTY input")?;
-    Ok(Pty {
+    let pty = Pty {
         child,
         reader,
-        writer: Arc::new(Mutex::new(writer)),
         master: pair.master,
-    })
+    };
+    Ok((pty, Arc::new(Mutex::new(writer))))
 }
 
 fn run(args: RunArgs) -> Result<i32> {
     validate_terminal(&args.terminal)?;
     let recorder = create_recorder(&args.terminal, &args.command)?;
-    let pty = open_pty(&args.terminal, &args.command)?;
-    let writer = pty.writer.clone();
+    let (pty, writer) = open_pty(&args.terminal, &args.command)?;
+    let handshake_input = handshake_input(&writer);
 
     let stdin_is_terminal = io::stdin().is_terminal();
     let _raw_mode = RawModeGuard::new(stdin_is_terminal)?;
@@ -233,7 +234,7 @@ fn run(args: RunArgs) -> Result<i32> {
     });
 
     let mut stdout = io::stdout().lock();
-    let code = pty.pump(|bytes| {
+    let code = pty.pump(handshake_input, |bytes| {
         stdout.write_all(bytes)?;
         stdout.flush()?;
         if let Some(recorder) = &recorder {
@@ -247,8 +248,7 @@ fn run(args: RunArgs) -> Result<i32> {
 fn host(args: HostArgs) -> Result<i32> {
     validate_terminal(&args.terminal)?;
     let recorder = create_recorder(&args.terminal, &args.command)?;
-    let pty = open_pty(&args.terminal, &args.command)?;
-    let writer = pty.writer.clone();
+    let (pty, writer) = open_pty(&args.terminal, &args.command)?;
     let parser = Arc::new(Mutex::new(vt100::Parser::new(
         args.terminal.rows,
         args.terminal.cols,
@@ -300,7 +300,7 @@ fn host(args: HostArgs) -> Result<i32> {
     );
 
     let mut stdout = io::stdout().lock();
-    let code = pty.pump(|bytes| {
+    let code = pty.pump(handshake_input(&writer), |bytes| {
         parser.lock().unwrap().process(bytes);
         if args.stdio {
             stdout.write_all(bytes)?;
@@ -318,14 +318,24 @@ fn host(args: HostArgs) -> Result<i32> {
     Ok(code)
 }
 
+/// The writer that answers conhost's handshake, which is needed on Windows only. It must not be
+/// kept elsewhere: on Unix, dropping the last reference to the writer is what sends the child its
+/// final end-of-file, and that has to stay with whoever owns the writer (the stdin thread in `run`).
+fn handshake_input(writer: &SharedWriter) -> Option<SharedWriter> {
+    cfg!(windows).then(|| writer.clone())
+}
+
 impl Pty {
     /// Passes the child's output to `consume` until it ends, then reaps the child and returns its
-    /// exit code.
-    fn pump(self, mut consume: impl FnMut(&[u8]) -> Result<()>) -> Result<i32> {
+    /// exit code. `input` is where the answer to conhost's handshake goes (see [`handshake_input`]).
+    fn pump(
+        self,
+        input: Option<SharedWriter>,
+        mut consume: impl FnMut(&[u8]) -> Result<()>,
+    ) -> Result<i32> {
         let Pty {
             mut child,
             mut reader,
-            writer,
             master,
         } = self;
         let mut handshake = conpty::HandshakeFilter::default();
@@ -334,8 +344,8 @@ impl Pty {
                 return consume(bytes);
             }
             let (bytes, reply) = handshake.filter(bytes);
-            if reply {
-                let mut input = writer.lock().unwrap();
+            if reply && let Some(input) = &input {
+                let mut input = input.lock().unwrap();
                 input.write_all(conpty::CURSOR_REPLY)?;
                 input.flush()?;
             }
