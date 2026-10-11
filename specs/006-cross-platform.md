@@ -65,26 +65,26 @@ Each item says how it was established.
 
 ## Verification status
 
-Results of 2026-10-11. Nothing below is assumed: "unverified" means it has not been run.
+Results of 2026-10-11. Nothing below is assumed: "unverified" means it has not been run. Linux was run at commit `ab2cf4a` (local `main`; not pushed when this was written); Windows was run on the same code before the commit messages were rewritten, which did not change the tree.
 
 | Platform | Result |
 |---|---|
 | Windows 10 (build 19045), native, `x86_64-pc-windows-gnu`, rustc 1.99.0, gcc from WinLibs | `cargo build --locked` and `cargo test --locked` pass: 12 unit tests and 7 integration tests. The integration suite was repeated 20 times and run in 4 concurrent processes without a failure. `cargo clippy --all-targets` is clean. |
 | Windows, MSVC toolchain | unverified (no MSVC tools on the machine used); only type-checked with `cargo check --all-targets --target x86_64-pc-windows-msvc`. |
-| Linux | **unverified.** The Docker run needed an elevation prompt that was declined, so it did not happen. The code type-checks (`cargo check --all-targets --target x86_64-unknown-linux-gnu`), which shows it compiles, not that it runs. |
+| Linux | pass (2026-10-11): Linux 6.18 (WSL2 kernel of Rancher Desktop) x86_64, image `rust:1-slim`, rustc 1.99.0, read-only mount of commit `ab2cf4a`: `cargo build --locked` and `cargo test --locked` pass (10 unit tests, 7 integration tests, exit code 0). Only the Windows-specific tests did not run there (the 2 unit tests under `cfg(windows)` and the Windows-only integration test), which is why the counts differ from Windows. Run from a Windows host, so this is a Linux kernel in a VM, not bare metal. |
 | macOS | **unverified.** Cannot be run locally; type-checks for `aarch64-apple-darwin`. Only CI can verify it. |
 
 Acceptance criteria:
 
 | # | Windows (native, GNU) | Linux | macOS |
 |---|---|---|---|
-| 1 build and test pass | pass | unverified | unverified |
-| 2 the five scenarios | pass (integration tests) | tests written, unverified | tests written, unverified |
+| 1 build and test pass | pass | pass | unverified |
+| 2 the four scenarios | pass (integration tests) | pass (integration tests) | tests written, unverified |
 | 3 flags and protocol unchanged | pass (diff review; `send --enter` test) | same code | same code |
-| 4 owner-only | pass: the DACL reads back as exactly one entry for the current user (`D:P(A;;FA;;;<SID>)`), and opening the pipe is denied for an identity whose user SID is deny-only while the current user connects. Mutation-checked: adding an Everyone entry makes both assertions fail. A literal second account was not used. | mode `0600` test written, unverified (checked by hand on 2026-10-10 before this work) | test written, unverified |
-| 5 unreachable after exit | pass (also after killing the host) | test written, unverified | test written, unverified |
-| 6 second host refused | pass | test written, unverified | test written, unverified |
-| 7 `run` unchanged on Unix | not applicable | unverified at runtime; the one behaviour found to depend on object ownership (the writer's final newline and EOF) is preserved and has a regression test | unverified |
+| 4 owner-only | pass: the DACL reads back as exactly one entry for the current user (`D:P(A;;FA;;;<SID>)`), and opening the pipe is denied for an identity whose user SID is deny-only while the current user connects. Mutation-checked: adding an Everyone entry makes both assertions fail. A literal second account was not used. | pass: `the_socket_is_private_to_the_owner` (mode `0600`), also checked by hand on 2026-10-10 | test written, unverified |
+| 5 unreachable after exit | pass (also after killing the host) | pass (the socket file is removed and `screen` fails; killing the host was not tried) | test written, unverified |
+| 6 second host refused | pass | pass | test written, unverified |
+| 7 `run` unchanged on Unix | not applicable | pass for what the tests cover: the original scenarios and the new regression test for the writer's final newline and EOF all pass; interactive use in a real terminal was not re-checked | unverified |
 
 Manual checks outside the automated tests: a `run` nested in a `host` as described above; killing a running host removes the pipe and the child.
 

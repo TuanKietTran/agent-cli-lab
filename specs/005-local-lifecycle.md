@@ -1,6 +1,6 @@
 # Local lifecycle: setup / run / teardown
 
-Linux was verified on 2026-10-10 from a Windows host with Docker (Rancher Desktop), image `rust:1-slim` (Rust 1.99, Linux x86_64), **before** the cross-platform work of spec 006. Native Windows (Rust 1.99, GNU toolchain) was verified on 2026-10-11 after it. A Linux re-run of the spec 006 code was requested but not performed (the elevation prompt for Docker was declined), so **Linux after spec 006 and macOS are unverified until CI has run**.
+Linux was verified by hand on 2026-10-10 from a Windows host with Docker (Rancher Desktop), image `rust:1-slim` (Rust 1.99, Linux x86_64), **before** the cross-platform work of spec 006. After it, Linux was verified again on 2026-10-11 with the automated suite at commit `ab2cf4a` (10 unit tests and 7 integration tests passed, read-only mount, the WSL2 kernel of Rancher Desktop), and native Windows (Rust 1.99, GNU toolchain) was verified on 2026-10-11. macOS is **unverified until CI has run**; it cannot be run locally.
 
 ## Platform
 
@@ -34,7 +34,7 @@ MSYS_NO_PATHCONV=1 docker run -d --name agent-cli-lab-dev \
   -e CARGO_HOME=/cache/cargo -e CARGO_TARGET_DIR=/cache/target \
   rust:1-slim sleep infinity                  # `$(pwd -W)` and MSYS_NO_PATHCONV are for Git Bash on Windows
 docker exec agent-cli-lab-dev cargo build --locked   # about 9s cold
-docker exec agent-cli-lab-dev cargo test --locked    # 3 unit + 4 integration tests, all passing
+docker exec agent-cli-lab-dev cargo test --locked    # 3 unit + 4 integration tests passed on 2026-10-10; 10 unit + 7 integration tests after spec 006
 ```
 
 Binary: `target/debug/agent-cli-lab`, or `/cache/target/debug/agent-cli-lab` in the container.
@@ -50,7 +50,7 @@ agent-cli-lab screen --socket PATH
 
 Acceptance criteria exercised by hand (the integration tests cover the same behavior programmatically):
 
-| Spec | Check | Linux (Docker, before spec 006) | Windows (native, after spec 006) |
+| Spec | Check | Linux (Docker, by hand, before spec 006) | Windows (native, after spec 006) |
 |---|---|---|---|
 | 001 | `--help` carries the "Recordings ... may contain secrets" warning | pass | pass |
 | 001 | Child sees a TTY on stdin and stdout; arguments after `--` arrive verbatim (`--flag`, `a b`) | pass | pass (TTY: integration test; arguments: `run -- cmd /c echo --flag "a b"` printed `--flag "a b"`) |
@@ -62,7 +62,9 @@ Acceptance criteria exercised by hand (the integration tests cover the same beha
 | 004 | `send --enter` from a separate call reaches the live child; a second `screen` shows the result | pass | pass |
 | 004 | Host exits 0 when the child exits and removes its socket | pass | pass (the pipe is gone and `screen` fails to connect) |
 | 004 | `screen` against a missing socket exits 1 with `failed to connect to <path>` | pass | pass |
-| 006 | A second `host` on the same `--socket` fails | not run | pass ("failed to bind socket ... already in use by another host?") |
+| 006 | A second `host` on the same `--socket` fails | pass (integration test, 2026-10-11) | pass ("failed to bind socket ... already in use by another host?") |
+
+The hand checks in the Linux column were not repeated after spec 006. The automated suite covers most of them and passed on Linux at `ab2cf4a`: TTY and output, piped input with and without a trailing newline, exit status and recording, hosted control through `send` and `screen`, socket mode `0600`, socket removal when the host exits, and a second host being refused. Not repeated on Linux: the `--help` warning and the missing-socket message.
 
 `send --enter` appends `\r`, not `\n`; see spec 003 for why that matters to TUIs.
 
