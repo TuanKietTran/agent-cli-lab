@@ -7,7 +7,7 @@
 ## Interface
 
 ```sh
-# Long-running PTY host
+# Long-running PTY host (on Windows `--socket` is a name, see spec 006)
 agent-cli-lab host --socket /tmp/pi.sock --record pi.jsonl -- pi --no-session
 
 # Separate agent calls while host is running
@@ -18,7 +18,7 @@ agent-cli-lab send --socket /tmp/pi.sock --enter '/exit'
 
 ## Protocol
 
-The host listens on a Unix-domain socket. Each client sends one JSON line and receives one JSON line.
+The host listens on a local socket: a Unix-domain socket on Unix, a named pipe on Windows (spec 006). Each client sends one JSON line and receives one JSON line. The protocol is the same on every platform.
 
 - `{"op":"send","data":[...bytes...]}` writes exact bytes to the PTY.
 - `{"op":"screen"}` returns the current terminal screen as plain text.
@@ -32,9 +32,10 @@ The host listens on a Unix-domain socket. Each client sends one JSON line and re
 - The host exposes a real PTY to the child.
 - Separate CLI invocations can submit input while the child is alive.
 - `screen` returns a rendered text snapshot rather than raw ANSI bytes.
-- Socket cleanup occurs after normal child exit.
+- Socket cleanup occurs after normal child exit (the Unix socket file is removed; a Windows pipe disappears with the host process).
+- Starting a second host on the same `--socket` fails instead of replacing the first.
 - Existing direct `run` behavior remains unchanged.
 
 ## Scope
 
-The first implementation supports Unix platforms. Authentication and remote network access are out of scope; callers must protect the local socket path with filesystem permissions.
+Linux, macOS and Windows are supported; see [006-cross-platform.md](006-cross-platform.md) for how `--socket` is interpreted on Windows and how access is restricted. Authentication and remote network access are out of scope. The socket is reachable only by the user who started the host: mode `0600` on Unix, a DACL that names only that user on Windows. Callers should still keep Unix socket paths in a directory that other users cannot write to.

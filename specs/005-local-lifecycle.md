@@ -1,20 +1,29 @@
 # Local lifecycle: setup / run / teardown
 
-Verified 2026-10-10 on Windows with Docker (Rancher Desktop) using the `rust:1-slim` image (Rust 1.99, Linux x86_64). Native Unix steps are taken from `Cargo.toml` and the README and were not run on a bare host.
+Linux was verified on 2026-10-10 from a Windows host with Docker (Rancher Desktop), image `rust:1-slim` (Rust 1.99, Linux x86_64), **before** the cross-platform work of spec 006. Native Windows (Rust 1.99, GNU toolchain) was verified on 2026-10-11 after it. A Linux re-run of the spec 006 code was requested but not performed (the elevation prompt for Docker was declined), so **Linux after spec 006 and macOS are unverified until CI has run**.
 
 ## Platform
 
-- Unix only. `src/lib.rs` imports `std::os::unix` (`UnixListener`, `UnixStream`, `PermissionsExt`) unconditionally, so the crate does not compile on native Windows, and `tests/proxy.rs` is `#![cfg(unix)]`. On a Windows host use a Linux container or WSL.
-- Needs Rust with edition 2024 support (1.85 or newer) and a C linker (`gcc`).
+- Linux, macOS and native Windows (spec 006). The Windows build uses ConPTY and needs Windows 10 version 1809 or newer.
+- Needs Rust with edition 2024 support (1.85 or newer) and a linker: `gcc` or `cc` on Linux and macOS (Xcode command line tools); on Windows either the MSVC toolchain with Visual Studio Build Tools, or the GNU toolchain with a `gcc` from MinGW-w64 on `PATH`.
 
 ## Setup
 
-Native Unix:
+Native (Linux, macOS, Windows):
 
 ```sh
 cargo build --locked        # dependencies are pinned by Cargo.lock; --locked keeps the file unmodified
-cargo test --locked
+cargo test --locked         # unit tests (12 on Windows, 10 elsewhere) and 6 integration tests (5 on every platform plus 1 specific to the OS family)
 ```
+
+Windows toolchain without admin rights (what was used to verify spec 006). `rustup-init.exe` comes from `https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-msvc/rustup-init.exe`; compare its SHA-256 with the `.sha256` file next to it, then:
+
+```powershell
+.\rustup-init.exe -y --no-modify-path --default-host x86_64-pc-windows-gnu --profile minimal
+$env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"    # this shell only; --no-modify-path left your PATH and registry alone
+```
+
+The GNU toolchain links through `gcc`; here it was the WinLibs MinGW-w64 package that `winget` had already installed (`BrechtSanders.WinLibs.POSIX.UCRT`). For the MSVC toolchain install Visual Studio Build Tools instead (C++ workload, several GB, needs admin) and use rustup's default host. The OS behaviour (ConPTY, named pipes, DACLs) is the same under both; CI builds with MSVC.
 
 Docker, nothing installed on the host. The repo is bind-mounted and Cargo's registry and `target/` go on a named volume, so the working tree stays clean and Windows file locking is avoided:
 
@@ -41,26 +50,30 @@ agent-cli-lab screen --socket PATH
 
 Acceptance criteria exercised by hand (the integration tests cover the same behavior programmatically):
 
-| Spec | Check | Result |
-|---|---|---|
-| 001 | `--help` carries the "Recordings ... may contain secrets" warning | pass |
-| 001 | Child sees a TTY on stdin and stdout; arguments after `--` arrive verbatim (`--flag`, `a b`) | pass |
-| 001 | Piped input reaches an interactive child (`printf ... \| run -- cat`) | pass; the text appears twice because the PTY echoes input |
-| 001 | Non-zero exit propagates (`exit 7` -> 7, `exit 3` -> 3) | pass |
-| 001 | No file is written without `--record`; with it the JSONL has a `header` first and an `exit` event with `code` last | pass |
-| 004 | `host` socket has mode `600` | pass |
-| 004 | `screen` returns plain text with ANSI colour and cursor codes rendered away | pass |
-| 004 | `send --enter` from a separate call reaches the live child; a second `screen` shows the result | pass |
-| 004 | Host exits 0 when the child exits and removes its socket | pass |
-| 004 | `screen` against a missing socket exits 1 with `failed to connect to <path>` | pass |
+| Spec | Check | Linux (Docker, before spec 006) | Windows (native, after spec 006) |
+|---|---|---|---|
+| 001 | `--help` carries the "Recordings ... may contain secrets" warning | pass | pass |
+| 001 | Child sees a TTY on stdin and stdout; arguments after `--` arrive verbatim (`--flag`, `a b`) | pass | pass (TTY: integration test; arguments: `run -- cmd /c echo --flag "a b"` printed `--flag "a b"`) |
+| 001 | Piped input reaches an interactive child (`printf ... \| run -- cat`; on Windows `sort`) | pass; the text appears twice because the PTY echoes input | pass; also without a trailing newline |
+| 001 | Non-zero exit propagates (`exit 7` -> 7, `exit 3` -> 3) | pass | pass (7: integration test, 3: by hand) |
+| 001 | No file is written without `--record`; with it the JSONL has a `header` first and an `exit` event with `code` last | pass | pass |
+| 004 | `host` socket is owner-only | pass (mode `600`) | pass (not a file: the pipe's DACL has one entry, for the current user; unit test) |
+| 004 | `screen` returns plain text with ANSI colour and cursor codes rendered away | pass | pass |
+| 004 | `send --enter` from a separate call reaches the live child; a second `screen` shows the result | pass | pass |
+| 004 | Host exits 0 when the child exits and removes its socket | pass | pass (the pipe is gone and `screen` fails to connect) |
+| 004 | `screen` against a missing socket exits 1 with `failed to connect to <path>` | pass | pass |
+| 006 | A second `host` on the same `--socket` fails | not run | pass ("failed to bind socket ... already in use by another host?") |
 
 `send --enter` appends `\r`, not `\n`; see spec 003 for why that matters to TUIs.
 
+On Windows `--socket PATH` is only a name (spec 006): no file is created, so `ls` will not show it. The same value must be used for `host`, `send` and `screen`.
+
 ## Teardown
 
-- Stop a hosted session by letting the child exit, for example `send --enter '/exit'` or the child's own quit command. The host then removes its socket (spec 004). Cleanup after killing the host process itself was not checked.
+- Stop a hosted session by letting the child exit, for example `send --enter '/exit'` or the child's own quit command. The host then removes its socket (spec 004).
+- Killing the host process itself: on Windows (checked 2026-10-11) the pipe vanishes at once and the child process is terminated together with the host, so nothing is left behind. On Unix a killed host cannot remove its socket file, so a stale file is expected to remain until it is deleted by hand; not checked.
 - Recordings (`*.jsonl`, gitignored) contain every input and output byte and may contain secrets; delete them when done.
-- Native: `cargo clean`.
+- Native: `cargo clean`. On Windows a toolchain installed with the commands under Setup is removed with `rustup self uninstall`, which deletes `%USERPROFILE%\.cargo` and `%USERPROFILE%\.rustup` (there is no PATH entry to revert because of `--no-modify-path`).
 - Docker:
 
   ```sh
@@ -76,4 +89,5 @@ After teardown `git status --short --ignored` is empty.
 - Spec 003 (Pi TUI smoke test) needs the `pi` CLI and a model; it was not run.
 - `host --stdio` (human and agent sharing one terminal) was not exercised.
 - Spec 002 (`scenario`) is not implemented.
-- Native macOS or Linux hosts, and native Windows (unsupported, see Platform).
+- Native macOS (CI only) and native Linux hosts (Linux was run in a container).
+- Windows: the virtual-terminal console modes that `run` and `host --stdio` switch on were exercised only with a ConPTY as the console (a `run` nested inside a `host`), not in a classic conhost window or Windows Terminal.

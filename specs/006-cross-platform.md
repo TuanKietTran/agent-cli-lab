@@ -30,17 +30,17 @@ Use the [`interprocess`](https://crates.io/crates/interprocess) crate's `local_s
 ### Owner-only access
 
 - **Unix:** `chmod 0600` right after `bind`, as before. `interprocess`'s `.mode()` (`fchmod` before `bind`) is not used because `fchmod` on a socket is not supported everywhere, macOS included.
-- **Windows:** the default named-pipe security is not enough: it grants Everyone read access. The listener is created with an explicit protected DACL `D:P(A;;GA;;;<current user SID>)`: full control for the current user only, no inheritance, no Everyone, no Anonymous, no network access. The user's SID is read from the process token. The "owner rights" alias is not used because an elevated administrator's token owner is the Administrators group. The listener also rejects remote clients (`PIPE_REJECT_REMOTE_CLIENTS`, the `interprocess` default) and creates the first instance with `FILE_FLAG_FIRST_PIPE_INSTANCE`, so a host cannot start on a pipe name somebody else already owns.
+- **Windows:** the default named-pipe security is not enough: it grants Everyone read access. The listener is created with an explicit protected DACL `D:P(A;;GA;;;<current user SID>)`: full control for the current user only, no inheritance, no Everyone, no Anonymous, no network access. The user's SID is read from the process token. The "owner rights" alias is not used because an elevated administrator's token owner is the Administrators group. The listener also rejects remote clients (`PIPE_REJECT_REMOTE_CLIENTS`; this is the `interprocess` default, read in its source and not tested separately) and creates the first instance with `FILE_FLAG_FIRST_PIPE_INSTANCE`, so a host cannot start on a pipe name somebody else already owns (tested: the second host is refused).
 - Not covered: a local attacker who creates the pipe name before the host starts can receive what a client sends. Same limitation as a pre-created Unix socket in a world-writable directory.
 
 ### ConPTY details (Windows)
 
-Found by reading `portable-pty` 0.9 and then checked by running; the results are in the table below.
+Each item says how it was established.
 
-1. Dropping the master closes the pseudo-console and kills the child. `open_pty` therefore keeps the master alive and drops it only after the child exits, which is also what makes the output reader see EOF (conhost never closes it by itself).
-2. `portable-pty` creates the pseudo-console with `PSEUDOCONSOLE_INHERIT_CURSOR`: conhost writes `ESC[6n` (cursor position request) and expects a reply. The proxy answers `ESC[1;1R` and removes the request from the forwarded, recorded and rendered output, because it is conhost's handshake and not the child's output.
-3. Ctrl-D is not end-of-file for a Windows console program. When `run` reads EOF from a non-terminal stdin it sends the Windows end-of-file key instead of `0x04` (see the table for what was verified).
-4. When stdin or stdout is a real console, the proxy enables virtual-terminal input and output processing and restores the previous modes on exit, so escape sequences and arrow keys pass through on classic conhost as well as Windows Terminal.
+1. Dropping the master closes the pseudo-console and kills the child (read in the `portable-pty` 0.9 source; not tested on its own). The master is therefore kept alive and dropped only after the child exits, from a thread that waits for the child; closing it is also what ends the output stream, because conhost does not close it by itself. Killing a host takes its child with it.
+2. `portable-pty` creates the pseudo-console with `PSEUDOCONSOLE_INHERIT_CURSOR`: conhost writes `ESC[6n` (cursor position request) and expects a reply. The proxy answers `ESC[1;1R` and removes the request from the forwarded, recorded and rendered output, because it is conhost's handshake and not the child's output. Confirmed by running: with the reply the child starts within about 0.2 s; with the reply disabled it never starts (no output, 20 s timeout).
+3. Ctrl-D is not end-of-file for a Windows console program. When `run` reads EOF from a non-terminal stdin it sends Ctrl-Z followed by Enter (`0x1a 0x0d`) instead of `0x04`. Confirmed by running `sort`: Ctrl-D and a bare Ctrl-Z leave it waiting, Ctrl-Z plus Enter ends it, with or without a trailing newline in the data.
+4. When stdin or stdout is a real console, the proxy enables virtual-terminal input and output processing and restores the previous modes on exit, so escape sequences and arrow keys pass through on classic conhost as well as Windows Terminal. Exercised only with a ConPTY as the console (a `run` nested inside a `host`: typing, output and the exit code pass through); not tried in a classic conhost window or Windows Terminal.
 5. `send --enter` is still carriage return (`0x0d`) on every platform; ConPTY turns it into an Enter key.
 6. Resize: the proxy has no resize feature on any platform (the size is fixed by `--cols` and `--rows`), so there is nothing to port.
 7. Exit codes: the child's exit code is propagated as before (`GetExitCodeProcess` on Windows).
@@ -65,4 +65,33 @@ Found by reading `portable-pty` 0.9 and then checked by running; the results are
 
 ## Verification status
 
-Filled in with real results as the work proceeds (see the end of this file).
+Results of 2026-10-11. Nothing below is assumed: "unverified" means it has not been run.
+
+| Platform | Result |
+|---|---|
+| Windows 10 (build 19045), native, `x86_64-pc-windows-gnu`, rustc 1.99.0, gcc from WinLibs | `cargo build --locked` and `cargo test --locked` pass: 12 unit tests and 7 integration tests. The integration suite was repeated 20 times and run in 4 concurrent processes without a failure. `cargo clippy --all-targets` is clean. |
+| Windows, MSVC toolchain | unverified (no MSVC tools on the machine used); only type-checked with `cargo check --all-targets --target x86_64-pc-windows-msvc`. |
+| Linux | **unverified.** The Docker run needed an elevation prompt that was declined, so it did not happen. The code type-checks (`cargo check --all-targets --target x86_64-unknown-linux-gnu`), which shows it compiles, not that it runs. |
+| macOS | **unverified.** Cannot be run locally; type-checks for `aarch64-apple-darwin`. Only CI can verify it. |
+
+Acceptance criteria:
+
+| # | Windows (native, GNU) | Linux | macOS |
+|---|---|---|---|
+| 1 build and test pass | pass | unverified | unverified |
+| 2 the five scenarios | pass (integration tests) | tests written, unverified | tests written, unverified |
+| 3 flags and protocol unchanged | pass (diff review; `send --enter` test) | same code | same code |
+| 4 owner-only | pass: the DACL reads back as exactly one entry for the current user (`D:P(A;;FA;;;<SID>)`), and opening the pipe is denied for an identity whose user SID is deny-only while the current user connects. Mutation-checked: adding an Everyone entry makes both assertions fail. A literal second account was not used. | mode `0600` test written, unverified (checked by hand on 2026-10-10 before this work) | test written, unverified |
+| 5 unreachable after exit | pass (also after killing the host) | test written, unverified | test written, unverified |
+| 6 second host refused | pass | test written, unverified | test written, unverified |
+| 7 `run` unchanged on Unix | not applicable | unverified at runtime; the one behaviour found to depend on object ownership (the writer's final newline and EOF) is preserved and has a regression test | unverified |
+
+Manual checks outside the automated tests: a `run` nested in a `host` as described above; killing a running host removes the pipe and the child.
+
+## Known limitations
+
+- A client that connects to the host and sends nothing blocks the host's single accept loop. This is as before on Unix and the same on Windows; there is no read timeout.
+- A local attacker who creates the pipe name (or Unix socket path) before the host starts can receive what a client sends. The client does not check who the server is.
+- The "another user" check on Windows uses a token that differs from the current one only in its user SID, which the DACL evaluation treats like a different user. A test with a real second account (for example in CI) would be stronger.
+- On Windows the end-of-input sequence completes the current line first; data that ends mid-line gets Ctrl-Z attached to that line. Unix is unchanged.
+- The Unix socket gets its `0600` mode right after `bind`, as before, so there is a short window in which the umask-derived mode applies.
