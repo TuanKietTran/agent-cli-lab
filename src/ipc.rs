@@ -216,12 +216,13 @@ mod access_tests {
         Foundation::{CloseHandle, ERROR_PIPE_BUSY, HANDLE, LocalFree},
         Security::{
             Authorization::{
-                ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertStringSidToSidW,
+                ConvertSecurityDescriptorToStringSecurityDescriptorW,
+                ConvertStringSecurityDescriptorToSecurityDescriptorW, ConvertStringSidToSidW,
                 GetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
             },
-            CreateRestrictedToken, DACL_SECURITY_INFORMATION, DuplicateTokenEx, SID_AND_ATTRIBUTES,
-            SecurityImpersonation, TOKEN_DUPLICATE, TOKEN_IMPERSONATE, TOKEN_QUERY,
-            TokenImpersonation,
+            CreateRestrictedToken, DACL_SECURITY_INFORMATION, DuplicateTokenEx,
+            PSECURITY_DESCRIPTOR, SID_AND_ATTRIBUTES, SecurityImpersonation, TOKEN_DUPLICATE,
+            TOKEN_IMPERSONATE, TOKEN_QUERY, TokenImpersonation,
         },
         System::Threading::{GetCurrentProcess, OpenProcessToken, SetThreadToken},
     };
@@ -332,23 +333,7 @@ mod access_tests {
                     &mut descriptor,
                 );
                 if status == 0 {
-                    let mut text: *mut u16 = ptr::null_mut();
-                    assert_ne!(
-                        ConvertSecurityDescriptorToStringSecurityDescriptorW(
-                            descriptor,
-                            SDDL_REVISION_1,
-                            DACL_SECURITY_INFORMATION,
-                            &mut text,
-                            ptr::null_mut()
-                        ),
-                        0
-                    );
-                    let mut count = 0;
-                    while *text.add(count) != 0 {
-                        count += 1;
-                    }
-                    let sddl = String::from_utf16_lossy(std::slice::from_raw_parts(text, count));
-                    LocalFree(text.cast());
+                    let sddl = dacl_text(descriptor);
                     LocalFree(descriptor);
                     return sddl;
                 }
@@ -357,6 +342,68 @@ mod access_tests {
             thread::sleep(Duration::from_millis(20));
         }
         panic!("could not read the pipe's security descriptor");
+    }
+
+    /// The DACL of `descriptor` as SDDL text, spelled the way Windows spells it.
+    ///
+    /// # Safety
+    /// `descriptor` must point to a valid security descriptor.
+    unsafe fn dacl_text(descriptor: PSECURITY_DESCRIPTOR) -> String {
+        unsafe {
+            let mut text: *mut u16 = ptr::null_mut();
+            assert_ne!(
+                ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                    descriptor,
+                    SDDL_REVISION_1,
+                    DACL_SECURITY_INFORMATION,
+                    &mut text,
+                    ptr::null_mut()
+                ),
+                0
+            );
+            let mut count = 0;
+            while *text.add(count) != 0 {
+                count += 1;
+            }
+            let sddl = String::from_utf16_lossy(std::slice::from_raw_parts(text, count));
+            LocalFree(text.cast());
+            sddl
+        }
+    }
+
+    /// Spells an SDDL string the way Windows does. One SID can be written in several ways: the
+    /// built-in Administrator account (RID 500, the account of a CI runner) is read back as `LA`,
+    /// not as its full SID. Strings are only comparable after this round trip.
+    fn normalized(sddl: &str) -> String {
+        let wide = U16CString::from_str(sddl).unwrap();
+        unsafe {
+            let mut descriptor = ptr::null_mut();
+            assert_ne!(
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    wide.as_ptr(),
+                    SDDL_REVISION_1,
+                    &mut descriptor,
+                    ptr::null_mut()
+                ),
+                0,
+                "{}",
+                io::Error::last_os_error()
+            );
+            let text = dacl_text(descriptor);
+            LocalFree(descriptor);
+            text
+        }
+    }
+
+    #[test]
+    fn a_sid_and_its_alias_compare_equal_once_normalized() {
+        let by_sid = "D:P(A;;FA;;;S-1-5-32-544)";
+        let by_alias = "D:P(A;;FA;;;BA)";
+        assert_ne!(by_sid, by_alias);
+        assert_eq!(normalized(by_sid), normalized(by_alias));
+        // Normalizing must not blur different principals or rights.
+        assert_ne!(normalized(by_alias), normalized("D:P(A;;FA;;;WD)"));
+        assert_ne!(normalized(by_alias), normalized("D:P(A;;FR;;;BA)"));
     }
 
     fn pipe_path(socket: &Path) -> String {
@@ -398,7 +445,7 @@ mod access_tests {
 
             assert_eq!(
                 dacl_of(&pipe),
-                format!("D:P(A;;FA;;;{sid})"),
+                normalized(&format!("D:P(A;;FA;;;{sid})")),
                 "exactly one protected entry, for the current user"
             );
             open_as(&impersonation_token(&sid, false), &pipe)
