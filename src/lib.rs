@@ -13,7 +13,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -51,12 +51,14 @@ enum Commands {
     Host(HostArgs),
     /// Send text or control keys to a hosted PTY.
     Send(SendArgs),
+    /// Type text and Enter, wait until the screen stops changing, then print it (send + wait + screen).
+    Ask(AskArgs),
     /// Print the current rendered screen of a hosted PTY.
     Screen(SocketArgs),
     /// Attach this terminal to a hosted PTY.
     Attach(AttachArgs),
     /// Show a hosted PTY in the foreground, opening a terminal when needed.
-    Foreground(AttachArgs),
+    Foreground(ForegroundArgs),
     /// Resolve the socket path used by the shorthand commands.
     Socket(SocketAliasArgs),
 }
@@ -127,6 +129,36 @@ struct AttachArgs {
 }
 
 #[derive(Debug, Args)]
+struct ForegroundArgs {
+    #[command(flatten)]
+    attach: AttachArgs,
+    /// Terminal width in columns when a command is given.
+    #[arg(long, short = 'C', default_value_t = 120)]
+    cols: u16,
+    /// Terminal height in rows when a command is given.
+    #[arg(long, short = 'R', default_value_t = 36)]
+    rows: u16,
+    /// Optional command to host first, e.g. `foreground -- pi`. Place it after `--`.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    command: Vec<OsString>,
+}
+
+#[derive(Debug, Args)]
+struct AskArgs {
+    #[command(flatten)]
+    connection: SocketArgs,
+    /// Text to type, followed by Enter. Omit to only wait for the screen to settle.
+    #[arg(default_value = "")]
+    text: String,
+    /// The screen counts as settled after it stays unchanged this many milliseconds.
+    #[arg(long, short = 'i', default_value_t = 1500)]
+    idle_ms: u64,
+    /// Give up waiting and print the screen after this many seconds.
+    #[arg(long, short = 't', default_value_t = 120)]
+    timeout: u64,
+}
+
+#[derive(Debug, Args)]
 struct SendArgs {
     #[command(flatten)]
     connection: SocketArgs,
@@ -149,6 +181,7 @@ pub fn execute(cli: Cli) -> Result<i32> {
         Commands::Run(args) => run(args),
         Commands::Host(args) => host(args),
         Commands::Send(args) => send(args),
+        Commands::Ask(args) => ask(args),
         Commands::Screen(args) => screen(args),
         Commands::Attach(args) => attach(args),
         Commands::Foreground(args) => foreground(args),
@@ -241,7 +274,17 @@ struct Pty {
     reader: Box<dyn Read + Send>,
     /// Must stay alive until the child has exited: on Windows, dropping it closes the
     /// pseudo-console and kills the child.
-    master: Box<dyn MasterPty + Send>,
+    master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
+}
+
+/// Lets the control socket resize the PTY without keeping it alive: the pump drops the strong
+/// reference when the child exits, which on Windows must really close the pseudo-console.
+type Resizer = std::sync::Weak<Mutex<Box<dyn MasterPty + Send>>>;
+
+impl Pty {
+    fn resizer(&self) -> Resizer {
+        Arc::downgrade(&self.master)
+    }
 }
 
 /// The PTY and the writer for its input. Dropping the last reference to the writer makes it send
@@ -276,7 +319,7 @@ fn open_pty(args: &TerminalArgs, child_command: &[OsString]) -> Result<(Pty, Sha
     let pty = Pty {
         child,
         reader,
-        master: pair.master,
+        master: Arc::new(Mutex::new(pair.master)),
     };
     Ok((pty, Arc::new(Mutex::new(writer))))
 }
@@ -330,6 +373,7 @@ fn host(args: HostArgs) -> Result<i32> {
     validate_terminal(&args.terminal)?;
     let recorder = create_recorder(&args.terminal, &args.command)?;
     let (pty, writer) = open_pty(&args.terminal, &args.command)?;
+    let resizer = pty.resizer();
     let parser = Arc::new(Mutex::new(vt100::Parser::new(
         args.terminal.rows,
         args.terminal.cols,
@@ -347,6 +391,7 @@ fn host(args: HostArgs) -> Result<i32> {
             listener,
             listener_writer,
             listener_parser,
+            resizer,
             listener_recorder,
             listener_stopped,
         )
@@ -491,6 +536,10 @@ struct ControlRequest {
     op: String,
     #[serde(default)]
     data: Vec<u8>,
+    #[serde(default)]
+    rows: u16,
+    #[serde(default)]
+    cols: u16,
 }
 
 #[derive(Debug, Serialize)]
@@ -506,13 +555,14 @@ fn serve_socket(
     listener: ipc::Listener,
     writer: SharedWriter,
     parser: Arc<Mutex<vt100::Parser>>,
+    resizer: Resizer,
     recorder: Option<Arc<Mutex<Recorder>>>,
     stopped: Arc<AtomicBool>,
 ) {
     while !stopped.load(Ordering::Acquire) {
         match ipc::accept(&listener) {
             Ok(stream) => {
-                let _ = handle_control(stream, &writer, &parser, &recorder);
+                let _ = handle_control(stream, &writer, &parser, &resizer, &recorder);
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(20));
@@ -526,6 +576,7 @@ fn handle_control(
     stream: ipc::Stream,
     writer: &SharedWriter,
     parser: &Arc<Mutex<vt100::Parser>>,
+    resizer: &Resizer,
     recorder: &Option<Arc<Mutex<Recorder>>>,
 ) -> Result<()> {
     let mut line = String::new();
@@ -559,6 +610,38 @@ fn handle_control(
             screen: Some(parser.lock().unwrap().screen().contents()),
             error: None,
         },
+        Ok(request) if request.op == "screen_ansi" => {
+            let parser = parser.lock().unwrap();
+            let screen = parser.screen();
+            let mut bytes = screen.contents_formatted();
+            let (row, col) = screen.cursor_position();
+            bytes.extend(format!("\x1b[{};{}H", row + 1, col + 1).bytes());
+            bytes.extend(if screen.hide_cursor() { &b"\x1b[?25l"[..] } else { &b"\x1b[?25h"[..] });
+            ControlResponse {
+                ok: true,
+                screen: Some(String::from_utf8_lossy(&bytes).into_owned()),
+                error: None,
+            }
+        }
+        Ok(request) if request.op == "resize" && request.rows > 0 && request.cols > 0 => {
+            let size = PtySize {
+                rows: request.rows,
+                cols: request.cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            };
+            let result = match resizer.upgrade() {
+                Some(master) => master.lock().unwrap().resize(size).map_err(|e| e.to_string()),
+                None => Err("the child has exited".to_string()),
+            };
+            match result {
+                Ok(()) => {
+                    parser.lock().unwrap().set_size(request.rows, request.cols);
+                    ControlResponse { ok: true, screen: None, error: None }
+                }
+                Err(error) => ControlResponse { ok: false, screen: None, error: Some(error) },
+            }
+        }
         Ok(request) => ControlResponse {
             ok: false,
             screen: None,
@@ -594,6 +677,33 @@ fn send(args: SendArgs) -> Result<i32> {
     Ok(0)
 }
 
+/// Sends `text` plus Enter, then polls until the screen has not changed for `idle_ms`.
+fn ask(args: AskArgs) -> Result<i32> {
+    if !args.text.is_empty() {
+        let mut data = args.text.into_bytes();
+        data.push(b'\r');
+        request(&args.connection.socket, json!({ "op": "send", "data": data }))?;
+    }
+    let poll = Duration::from_millis(100);
+    let idle = Duration::from_millis(args.idle_ms);
+    let deadline = Instant::now() + Duration::from_secs(args.timeout);
+    let mut last = String::new();
+    let mut changed = Instant::now();
+    loop {
+        let response = request(&args.connection.socket, json!({ "op": "screen" }))?;
+        let current = response.get("screen").and_then(Value::as_str).unwrap_or_default();
+        if current != last {
+            last = current.to_owned();
+            changed = Instant::now();
+        }
+        if changed.elapsed() >= idle || Instant::now() >= deadline {
+            println!("{last}");
+            return Ok(0);
+        }
+        thread::sleep(poll);
+    }
+}
+
 fn screen(args: SocketArgs) -> Result<i32> {
     let response = request(&args.socket, json!({ "op": "screen" }))?;
     if let Some(contents) = response.get("screen").and_then(Value::as_str) {
@@ -602,13 +712,45 @@ fn screen(args: SocketArgs) -> Result<i32> {
     Ok(0)
 }
 
-fn foreground(args: AttachArgs) -> Result<i32> {
-    if io::stdin().is_terminal() {
-        return attach(args);
+fn foreground(args: ForegroundArgs) -> Result<i32> {
+    let socket = args.attach.connection.socket.clone();
+    if !args.command.is_empty() {
+        host_detached(&socket, args.cols, args.rows, &args.command)?;
     }
-    open_attach_terminal(&args.connection.socket, args.terminal.as_deref())?;
-    println!("opened foreground attach for {}", args.connection.socket.display());
+    if io::stdin().is_terminal() {
+        return attach(args.attach);
+    }
+    open_attach_terminal(&socket, args.attach.terminal.as_deref())?;
+    println!("opened foreground attach for {}", socket.display());
     Ok(0)
+}
+
+/// Start `host` in the background and wait until its socket answers.
+fn host_detached(socket: &Path, cols: u16, rows: u16, command: &[OsString]) -> Result<()> {
+    let exe = env::current_exe().context("failed to resolve agent-cli-lab executable")?;
+    let mut host = Command::new(exe);
+    host.arg("host")
+        .arg("-s")
+        .arg(socket)
+        .arg("-C")
+        .arg(cols.to_string())
+        .arg("-R")
+        .arg(rows.to_string())
+        .arg("--")
+        .args(command)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut host, 0);
+    host.spawn().context("failed to start host")?;
+    for _ in 0..50 {
+        if request(socket, json!({ "op": "screen" })).is_ok() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    Err(anyhow!("host did not become ready on {}", socket.display()))
 }
 
 fn open_attach_terminal(socket: &Path, terminal: Option<&str>) -> Result<()> {
@@ -632,12 +774,26 @@ fn open_attach_terminal_impl(exe: &Path, socket: &Path, terminal: Option<&str>) 
             Path::new("/usr/local/bin/ghostty"),
         ] {
             if ghostty.exists() {
+                // A separate Ghostty process opens at the default position, on top of the existing
+                // window; cascade each new one so it stays visible.
+                let offset = 40 * (std::process::id() % 8) as i32;
+                // `-e` makes Ghostty ask "Allow Ghostty to execute ...?" on every launch. A command
+                // set from a config file does not, so write one and layer it over the user's config.
+                let config = env::temp_dir()
+                    .join(format!("agent-cli-lab-ghostty-{}.conf", std::process::id()));
+                fs::write(
+                    &config,
+                    format!(
+                        "command = {} attach -s {}\nconfirm-close-surface = false\nquit-after-last-window-closed = true\nwindow-save-state = never\nwindow-position-x = {}\nwindow-position-y = {}\n",
+                        shell_quote(&exe.to_string_lossy()),
+                        shell_quote(&socket.to_string_lossy()),
+                        80 + offset,
+                        80 + offset,
+                    ),
+                )
+                .with_context(|| format!("failed to write {}", config.display()))?;
                 Command::new(ghostty)
-                    .arg("-e")
-                    .arg(exe)
-                    .arg("attach")
-                    .arg("-s")
-                    .arg(socket)
+                    .arg(format!("--config-file={}", config.display()))
                     .spawn()
                     .context("failed to open Ghostty foreground attach")?;
                 return Ok(());
@@ -726,6 +882,7 @@ fn attach(args: AttachArgs) -> Result<i32> {
     let _raw_mode = RawModeGuard::new(true)?;
     let mut stdout = io::stdout().lock();
     let mut last_screen = String::new();
+    let mut size = sync_attached_size(&socket, None);
     render_attached_screen(&socket, &mut stdout, &mut last_screen)?;
 
     let input_thread = thread::spawn(move || -> Result<()> {
@@ -756,6 +913,7 @@ fn attach(args: AttachArgs) -> Result<i32> {
     });
 
     while !stopped.load(Ordering::Acquire) {
+        size = sync_attached_size(&socket, size);
         if let Err(error) = render_attached_screen(&socket, &mut stdout, &mut last_screen) {
             stopped.store(true, Ordering::Release);
             if !last_screen.is_empty() {
@@ -773,15 +931,38 @@ fn attach(args: AttachArgs) -> Result<i32> {
     Ok(0)
 }
 
+/// Resizes the hosted PTY to this terminal's size when it changed, so the child lays itself out for
+/// the window it is shown in. Returns the size last applied.
+fn sync_attached_size(socket: &Path, last: Option<(u16, u16)>) -> Option<(u16, u16)> {
+    let current = crossterm::terminal::size().ok()?;
+    if Some(current) == last {
+        return last;
+    }
+    let (cols, rows) = current;
+    match request(socket, json!({ "op": "resize", "cols": cols, "rows": rows })) {
+        Ok(_) => Some(current),
+        Err(_) => last,
+    }
+}
+
 fn render_attached_screen(
     socket: &Path,
     stdout: &mut impl Write,
     last_screen: &mut String,
 ) -> Result<()> {
-    let response = request(socket, json!({ "op": "screen" }))?;
+    let mut response = request(socket, json!({ "op": "screen_ansi" }))?;
+    let mut legacy = false;
+    if response.get("ok").and_then(Value::as_bool) != Some(true) {
+        // An older host without `screen_ansi`: plain text, with carriage returns for raw mode.
+        response = request(socket, json!({ "op": "screen" }))?;
+        legacy = true;
+    }
     if let Some(contents) = response.get("screen").and_then(Value::as_str) {
+        let legacy_text = contents.replace('\n', "\r\n");
+        let contents = if legacy { legacy_text.as_str() } else { contents };
         if contents != last_screen {
-            write!(stdout, "\x1b[2J\x1b[H{contents}")?;
+            // Synchronized update, home, clear, then the formatted cells, cursor and visibility.
+            write!(stdout, "\x1b[?2026h\x1b[?25l\x1b[H\x1b[2J{contents}\x1b[?2026l")?;
             stdout.flush()?;
             last_screen.clear();
             last_screen.push_str(contents);
