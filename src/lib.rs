@@ -7,6 +7,7 @@ use std::{
     fs::{self, File},
     io::{self, BufRead, BufReader, IsTerminal, Read, Write},
     path::{Path, PathBuf},
+    process::Command,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -54,6 +55,8 @@ enum Commands {
     Screen(SocketArgs),
     /// Attach this terminal to a hosted PTY.
     Attach(AttachArgs),
+    /// Show a hosted PTY in the foreground, opening a terminal when needed.
+    Foreground(AttachArgs),
     /// Resolve the socket path used by the shorthand commands.
     Socket(SocketAliasArgs),
 }
@@ -117,6 +120,10 @@ struct AttachArgs {
     /// Milliseconds between screen refreshes.
     #[arg(long, default_value_t = 100)]
     interval_ms: u64,
+    /// Terminal app to open for `foreground` from a non-terminal context.
+    /// Defaults to $AGENT_CLI_LAB_TERMINAL, then Ghostty on macOS.
+    #[arg(long, value_name = "NAME")]
+    terminal: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -144,6 +151,7 @@ pub fn execute(cli: Cli) -> Result<i32> {
         Commands::Send(args) => send(args),
         Commands::Screen(args) => screen(args),
         Commands::Attach(args) => attach(args),
+        Commands::Foreground(args) => foreground(args),
         Commands::Socket(args) => print_default_socket(args),
     }
 }
@@ -594,6 +602,111 @@ fn screen(args: SocketArgs) -> Result<i32> {
     Ok(0)
 }
 
+fn foreground(args: AttachArgs) -> Result<i32> {
+    if io::stdin().is_terminal() {
+        return attach(args);
+    }
+    open_attach_terminal(&args.connection.socket, args.terminal.as_deref())?;
+    println!("opened foreground attach for {}", args.connection.socket.display());
+    Ok(0)
+}
+
+fn open_attach_terminal(socket: &Path, terminal: Option<&str>) -> Result<()> {
+    let exe = env::current_exe().context("failed to resolve agent-cli-lab executable")?;
+    let terminal = terminal
+        .map(str::to_owned)
+        .or_else(|| env::var("AGENT_CLI_LAB_TERMINAL").ok())
+        .filter(|value| !value.trim().is_empty());
+    open_attach_terminal_impl(&exe, socket, terminal.as_deref())
+}
+
+#[cfg(target_os = "macos")]
+fn open_attach_terminal_impl(exe: &Path, socket: &Path, terminal: Option<&str>) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let terminal = terminal.unwrap_or("ghostty").to_ascii_lowercase();
+    if terminal == "ghostty" {
+        for ghostty in [
+            Path::new("/Applications/Ghostty.app/Contents/MacOS/ghostty"),
+            Path::new("/opt/homebrew/bin/ghostty"),
+            Path::new("/usr/local/bin/ghostty"),
+        ] {
+            if ghostty.exists() {
+                Command::new(ghostty)
+                    .arg("-e")
+                    .arg(exe)
+                    .arg("attach")
+                    .arg("-s")
+                    .arg(socket)
+                    .spawn()
+                    .context("failed to open Ghostty foreground attach")?;
+                return Ok(());
+            }
+        }
+        return Err(anyhow!("Ghostty was requested but no Ghostty executable was found"));
+    }
+
+    // Terminal.app fallback: it opens executable .command files.
+    let script = env::temp_dir().join(format!("agent-cli-lab-attach-{}.command", std::process::id()));
+    let body = format!(
+        "#!/bin/sh\nexec {} attach -s {}\n",
+        shell_quote(&exe.to_string_lossy()),
+        shell_quote(&socket.to_string_lossy()),
+    );
+    fs::write(&script, body).with_context(|| format!("failed to write {}", script.display()))?;
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("failed to mark {} executable", script.display()))?;
+    Command::new("open")
+        .args(["-a", "Terminal"])
+        .arg(&script)
+        .spawn()
+        .context("failed to open Terminal.app")?;
+    Ok(())
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn open_attach_terminal_impl(exe: &Path, socket: &Path, terminal: Option<&str>) -> Result<()> {
+    if let Some(terminal) = terminal {
+        Command::new(terminal)
+            .arg("-e")
+            .arg(exe)
+            .arg("attach")
+            .arg("-s")
+            .arg(socket)
+            .spawn()
+            .with_context(|| format!("failed to open terminal {terminal}"))?;
+        return Ok(());
+    }
+    let candidates: &[(&str, &[&str])] = &[
+        ("x-terminal-emulator", &["-e"]),
+        ("gnome-terminal", &["--"]),
+        ("konsole", &["-e"]),
+        ("xterm", &["-e"]),
+    ];
+    for (program, prefix) in candidates {
+        let mut command = Command::new(program);
+        command.args(*prefix).arg(exe).arg("attach").arg("-s").arg(socket);
+        if command.spawn().is_ok() {
+            return Ok(());
+        }
+    }
+    Err(anyhow!("failed to find a terminal emulator for foreground attach"))
+}
+
+#[cfg(windows)]
+fn open_attach_terminal_impl(exe: &Path, socket: &Path, terminal: Option<&str>) -> Result<()> {
+    Command::new(terminal.unwrap_or("cmd"))
+        .args(["/C", "start", "", &exe.to_string_lossy(), "attach", "-s", &socket.to_string_lossy()])
+        .spawn()
+        .context("failed to open a Windows Terminal window")?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 fn attach(args: AttachArgs) -> Result<i32> {
     let socket = args.connection.socket;
     let interval = Duration::from_millis(args.interval_ms.max(16));
@@ -601,11 +714,16 @@ fn attach(args: AttachArgs) -> Result<i32> {
     let input_stopped = stopped.clone();
     let input_socket = socket.clone();
 
-    eprintln!("attached to {}; press Ctrl-] to detach", socket.display());
     let stdin_is_terminal = io::stdin().is_terminal();
+    if !stdin_is_terminal {
+        return Err(anyhow!(
+            "attach requires terminal stdin; use `send` and `screen` for headless control"
+        ));
+    }
+    eprintln!("attached to {}; press Ctrl-] to detach", socket.display());
     let stdout_is_terminal = io::stdout().is_terminal();
-    let _console = conpty::ConsoleModes::enable(stdin_is_terminal, stdout_is_terminal);
-    let _raw_mode = RawModeGuard::new(stdin_is_terminal)?;
+    let _console = conpty::ConsoleModes::enable(true, stdout_is_terminal);
+    let _raw_mode = RawModeGuard::new(true)?;
     let mut stdout = io::stdout().lock();
     let mut last_screen = String::new();
     render_attached_screen(&socket, &mut stdout, &mut last_screen)?;
@@ -621,12 +739,18 @@ fn attach(args: AttachArgs) -> Result<i32> {
             }
             if let Some(position) = buffer[..count].iter().position(|byte| *byte == 0x1d) {
                 if position > 0 {
-                    request(&input_socket, json!({ "op": "send", "data": &buffer[..position] }))?;
+                    request(
+                        &input_socket,
+                        json!({ "op": "send", "data": &buffer[..position] }),
+                    )?;
                 }
                 input_stopped.store(true, Ordering::Release);
                 break;
             }
-            request(&input_socket, json!({ "op": "send", "data": &buffer[..count] }))?;
+            request(
+                &input_socket,
+                json!({ "op": "send", "data": &buffer[..count] }),
+            )?;
         }
         Ok(())
     });
@@ -649,7 +773,11 @@ fn attach(args: AttachArgs) -> Result<i32> {
     Ok(0)
 }
 
-fn render_attached_screen(socket: &Path, stdout: &mut impl Write, last_screen: &mut String) -> Result<()> {
+fn render_attached_screen(
+    socket: &Path,
+    stdout: &mut impl Write,
+    last_screen: &mut String,
+) -> Result<()> {
     let response = request(socket, json!({ "op": "screen" }))?;
     if let Some(contents) = response.get("screen").and_then(Value::as_str) {
         if contents != last_screen {
@@ -815,7 +943,9 @@ mod tests {
 
         let cli = Cli::try_parse_from(["lab", "attach"]).unwrap();
         match cli.command {
-            Commands::Attach(args) => assert!(args.connection.socket.ends_with("agent-cli-lab.sock")),
+            Commands::Attach(args) => {
+                assert!(args.connection.socket.ends_with("agent-cli-lab.sock"))
+            }
             _ => panic!("expected attach command"),
         }
     }

@@ -200,6 +200,18 @@ fn piped_input_without_a_final_newline_still_ends_the_child() {
 }
 
 #[test]
+fn attach_requires_terminal_stdin() {
+    let output = Command::new(binary())
+        .arg("attach")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("attach requires terminal stdin"));
+}
+
+#[test]
 fn separate_calls_can_control_and_capture_a_hosted_tui() {
     let mut host = Host::start(os::TWO_LINES);
     host.wait_until_ready();

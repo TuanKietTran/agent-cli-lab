@@ -22,7 +22,7 @@ agent-cli-lab attach
 agent-cli-lab send -e '/exit'
 ```
 
-`screen` renders the current ANSI TUI into plain text. `attach` foregrounds the hosted PTY in the current terminal and forwards keys until Ctrl-]. `--enter`/`-e` sends carriage return, matching a real terminal Enter key.
+`screen` renders the current ANSI TUI into plain text. `attach` requires terminal stdin, foregrounds the hosted PTY in the current terminal, and forwards keys until Ctrl-]. `foreground` opens an attached terminal when called from a non-terminal context. Set `AGENT_CLI_LAB_TERMINAL` or pass `foreground --terminal NAME`; macOS defaults to Ghostty. `--enter`/`-e` sends carriage return, matching a real terminal Enter key.
 
 ## Platforms
 
