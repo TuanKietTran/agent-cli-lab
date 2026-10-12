@@ -9,11 +9,17 @@
 ```sh
 # Long-running PTY host (on Windows `--socket` is a name, see spec 006)
 agent-cli-lab host --socket /tmp/pi.sock --record pi.jsonl -- pi --no-session
+# Or, using the default socket and shorter flags:
+agent-cli-lab host -r pi.jsonl -- pi --no-session
 
 # Separate agent calls while host is running
 agent-cli-lab send --socket /tmp/pi.sock --enter 'Reply exactly: ONE'
 agent-cli-lab screen --socket /tmp/pi.sock
 agent-cli-lab send --socket /tmp/pi.sock --enter '/exit'
+# Or, with the default socket:
+agent-cli-lab send -e 'Reply exactly: ONE'
+agent-cli-lab screen
+agent-cli-lab send -e '/exit'
 ```
 
 ## Protocol
@@ -24,7 +30,7 @@ The host listens on a local socket: a Unix-domain socket on Unix, a named pipe o
 - `{"op":"screen"}` returns the current terminal screen as plain text.
 - Every response contains `ok`; errors also contain `error`.
 
-`send --enter` appends carriage return (`0x0d`), matching a real terminal Enter key.
+`send --enter`/`-e` appends carriage return (`0x0d`), matching a real terminal Enter key.
 
 ## Acceptance criteria
 

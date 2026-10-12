@@ -4,7 +4,7 @@
 
 `host`, `send` and `screen` (spec 004) were built on `std::os::unix` (`UnixListener`, `UnixStream`, `PermissionsExt`), so the crate did not compile on native Windows. Spec 005 told Windows users to use a container or WSL. The PTY layer (`portable-pty`, `crossterm`, `vt100`) is already cross-platform, so only the local IPC, its access control and a few ConPTY details block Windows. macOS differs from Linux only in details (socket path length, `fchmod` on sockets) and had never been built.
 
-Goal: `cargo build --locked` and `cargo test --locked` pass on Windows (native), macOS and Linux, and `run`, `host`, `send` and `screen` work on all three. The wire protocol and CLI flags do not change. Existing `run` behaviour on Unix does not change.
+Goal: `cargo build --locked` and `cargo test --locked` pass on Windows (native), macOS and Linux, and `run`, `host`, `send`, `screen`, and foreground `attach` work on all three. The wire protocol remains portable. Existing `run` behaviour on Unix does not change.
 
 ## Design
 
@@ -41,13 +41,13 @@ Each item says how it was established.
 2. `portable-pty` creates the pseudo-console with `PSEUDOCONSOLE_INHERIT_CURSOR`: conhost writes `ESC[6n` (cursor position request) and expects a reply. The proxy answers `ESC[1;1R` and removes the request from the forwarded, recorded and rendered output, because it is conhost's handshake and not the child's output. Confirmed by running: with the reply the child starts within about 0.2 s; with the reply disabled it never starts (no output, 20 s timeout).
 3. Ctrl-D is not end-of-file for a Windows console program. When `run` reads EOF from a non-terminal stdin it sends Ctrl-Z followed by Enter (`0x1a 0x0d`) instead of `0x04`. Confirmed by running `sort`: Ctrl-D and a bare Ctrl-Z leave it waiting, Ctrl-Z plus Enter ends it, with or without a trailing newline in the data.
 4. When stdin or stdout is a real console, the proxy enables virtual-terminal input and output processing and restores the previous modes on exit, so escape sequences and arrow keys pass through on classic conhost as well as Windows Terminal. Exercised only with a ConPTY as the console (a `run` nested inside a `host`: typing, output and the exit code pass through); not tried in a classic conhost window or Windows Terminal.
-5. `send --enter` is still carriage return (`0x0d`) on every platform; ConPTY turns it into an Enter key.
+5. `send --enter`/`-e` is still carriage return (`0x0d`) on every platform; ConPTY turns it into an Enter key.
 6. Resize: the proxy has no resize feature on any platform (the size is fixed by `--cols` and `--rows`), so there is nothing to port.
 7. Exit codes: the child's exit code is propagated as before (`GetExitCodeProcess` on Windows).
 
 ### Tests
 
-`tests/proxy.rs` no longer has `#![cfg(unix)]`. Each scenario picks its child command per platform (`sh` and `cat` on Unix; `cmd /c` and `powershell` on Windows) and has the same assertions. The host test waits for readiness by probing `screen` instead of checking that a socket file exists, and checks cleanup by confirming the host is no longer reachable. Pure logic (pipe-name mapping, ConPTY handshake filter) has unit tests that run on every platform.
+`tests/proxy.rs` no longer has `#![cfg(unix)]`. Each scenario picks its child command per platform (`sh` and `cat` on Unix; `cmd /c` and `powershell` on Windows) and has the same assertions. The host test waits for readiness by probing `screen` instead of checking that a socket file exists, and checks cleanup by confirming the host is no longer reachable. `attach` uses the same `send`/`screen` protocol, enables raw/virtual-terminal modes in the foreground terminal on Windows, and detaches locally with Ctrl-]. Pure logic (pipe-name mapping, ConPTY handshake filter) has unit tests that run on every platform.
 
 ### CI
 
@@ -57,7 +57,7 @@ Each item says how it was established.
 
 1. `cargo build --locked` and `cargo test --locked` pass on Windows (native), macOS and Linux.
 2. The three integration scenarios (TTY and output, piped input with EOF, hosted TUI control through `send` and `screen`) plus the exit-code and recording scenario pass on all three.
-3. CLI flags and the wire protocol are unchanged; `send --enter` sends `0x0d`.
+3. Existing long CLI flags and the wire protocol are unchanged; `send --enter`/`-e` sends `0x0d`.
 4. Unix socket mode is `0600`. On Windows the pipe's DACL contains exactly one allow entry, for the current user, and an identity other than that user cannot open the pipe.
 5. After the host exits it is unreachable on every platform; on Unix the socket file is removed.
 6. Starting a second host on the same `--socket` fails with an error instead of replacing the first.

@@ -42,10 +42,12 @@ Binary: `target/debug/agent-cli-lab`, or `/cache/target/debug/agent-cli-lab` in 
 ## Run
 
 ```sh
-agent-cli-lab run [--record PATH] -- COMMAND [ARG]...        # direct proxy, spec 001
-agent-cli-lab host --socket PATH [--record PATH] [--cols N] [--rows N] [--stdio] -- COMMAND ...   # spec 004
-agent-cli-lab send --socket PATH [--enter] 'text'
-agent-cli-lab screen --socket PATH
+agent-cli-lab run [--record PATH|-r PATH] -- COMMAND [ARG]...        # direct proxy, spec 001
+agent-cli-lab host [--socket PATH|-s PATH] [--record PATH|-r PATH] [--cols N|-C N] [--rows N|-R N] [--stdio] -- COMMAND ...   # spec 004
+agent-cli-lab send [--socket PATH|-s PATH] [--enter|-e] 'text'
+agent-cli-lab screen [--socket PATH|-s PATH]
+agent-cli-lab attach [--socket PATH|-s PATH]   # foreground a hosted PTY; Ctrl-] detaches
+agent-cli-lab socket --path-only   # print the resolved default socket
 ```
 
 Acceptance criteria exercised by hand (the integration tests cover the same behavior programmatically):
@@ -59,20 +61,20 @@ Acceptance criteria exercised by hand (the integration tests cover the same beha
 | 001 | No file is written without `--record`; with it the JSONL has a `header` first and an `exit` event with `code` last | pass | pass |
 | 004 | `host` socket is owner-only | pass (mode `600`) | pass (not a file: the pipe's DACL has one entry, for the current user; unit test) |
 | 004 | `screen` returns plain text with ANSI colour and cursor codes rendered away | pass | pass |
-| 004 | `send --enter` from a separate call reaches the live child; a second `screen` shows the result | pass | pass |
+| 004 | `send --enter`/`-e` from a separate call reaches the live child; a second `screen` shows the result | pass | pass |
 | 004 | Host exits 0 when the child exits and removes its socket | pass | pass (the pipe is gone and `screen` fails to connect) |
 | 004 | `screen` against a missing socket exits 1 with `failed to connect to <path>` | pass | pass |
 | 006 | A second `host` on the same `--socket` fails | pass (integration test, 2026-10-11) | pass ("failed to bind socket ... already in use by another host?") |
 
 The hand checks in the Linux column were not repeated after spec 006. The automated suite covers most of them and passed on Linux at `ab2cf4a`: TTY and output, piped input with and without a trailing newline, exit status and recording, hosted control through `send` and `screen`, socket mode `0600`, socket removal when the host exits, and a second host being refused. Not repeated on Linux: the `--help` warning and the missing-socket message.
 
-`send --enter` appends `\r`, not `\n`; see spec 003 for why that matters to TUIs.
+`send --enter`/`-e` appends `\r`, not `\n`; see spec 003 for why that matters to TUIs.
 
-On Windows `--socket PATH` is only a name (spec 006): no file is created, so `ls` will not show it. The same value must be used for `host`, `send` and `screen`.
+On Windows `--socket PATH` is only a name (spec 006): no file is created, so `ls` will not show it. Without `--socket`, `host`, `send` and `screen` use the same resolved default.
 
 ## Teardown
 
-- Stop a hosted session by letting the child exit, for example `send --enter '/exit'` or the child's own quit command. The host then removes its socket (spec 004).
+- Stop a hosted session by letting the child exit, for example `send -e '/exit'` or the child's own quit command. The host then removes its socket (spec 004).
 - Killing the host process itself: on Windows (checked 2026-10-11) the pipe vanishes at once and the child process is terminated together with the host, so nothing is left behind. On Unix a killed host cannot remove its socket file, so a stale file is expected to remain until it is deleted by hand; not checked.
 - Recordings (`*.jsonl`, gitignored) contain every input and output byte and may contain secrets; delete them when done.
 - Native: `cargo clean`. On Windows a toolchain installed with the commands under Setup is removed with `rustup self uninstall`, which deletes `%USERPROFILE%\.cargo` and `%USERPROFILE%\.rustup` (there is no PATH entry to revert because of `--no-modify-path`).

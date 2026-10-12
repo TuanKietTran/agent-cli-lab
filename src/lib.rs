@@ -2,8 +2,9 @@ mod conpty;
 mod ipc;
 
 use std::{
+    env,
     ffi::OsString,
-    fs::File,
+    fs::{self, File},
     io::{self, BufRead, BufReader, IsTerminal, Read, Write},
     path::{Path, PathBuf},
     sync::{
@@ -34,7 +35,7 @@ const END_OF_INPUT: &[u8] = &[0x1a, 0x0d];
     name = "agent-cli-lab",
     version,
     about = "Test and control interactive CLI programs through a pseudo-terminal",
-    after_help = "EXAMPLES:\n  agent-cli-lab run -- python3 -i\n  agent-cli-lab host --socket /tmp/pi.sock -- pi\n  agent-cli-lab send --socket /tmp/pi.sock --enter 'Hello'\n  agent-cli-lab screen --socket /tmp/pi.sock\n\nRecordings contain all input and output and may contain secrets."
+    after_help = "EXAMPLES:\n  agent-cli-lab run -- python3 -i\n  agent-cli-lab host -r pi.jsonl -- pi\n  agent-cli-lab send -e 'Hello'\n  agent-cli-lab screen\n  agent-cli-lab attach\n\nRecordings contain all input and output and may contain secrets."
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -51,6 +52,10 @@ enum Commands {
     Send(SendArgs),
     /// Print the current rendered screen of a hosted PTY.
     Screen(SocketArgs),
+    /// Attach this terminal to a hosted PTY.
+    Attach(AttachArgs),
+    /// Resolve the socket path used by the shorthand commands.
+    Socket(SocketAliasArgs),
 }
 
 #[derive(Debug, Args)]
@@ -68,7 +73,7 @@ struct HostArgs {
     terminal: TerminalArgs,
     /// Local socket used by `send` and `screen`. On Windows this is only a name: it is mapped to
     /// a named pipe that just the current user can open, and no file is created.
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, short = 's', value_name = "PATH", default_value_os_t = default_socket())]
     socket: PathBuf,
     /// Also display the TUI and accept keyboard input in this terminal.
     #[arg(long)]
@@ -81,21 +86,37 @@ struct HostArgs {
 #[derive(Debug, Args)]
 struct TerminalArgs {
     /// Write input, output, and exit events as JSON Lines.
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, short = 'r', value_name = "PATH")]
     record: Option<PathBuf>,
     /// Terminal width in columns.
-    #[arg(long, default_value_t = 80)]
+    #[arg(long, short = 'C', default_value_t = 80)]
     cols: u16,
     /// Terminal height in rows.
-    #[arg(long, default_value_t = 24)]
+    #[arg(long, short = 'R', default_value_t = 24)]
     rows: u16,
 }
 
 #[derive(Debug, Args)]
 struct SocketArgs {
     /// Local socket of the running host (the same value that was given to `host`).
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, short = 's', value_name = "PATH", default_value_os_t = default_socket())]
     socket: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct SocketAliasArgs {
+    /// Print only the path, without explanatory text.
+    #[arg(long, short = 'p')]
+    path_only: bool,
+}
+
+#[derive(Debug, Args)]
+struct AttachArgs {
+    #[command(flatten)]
+    connection: SocketArgs,
+    /// Milliseconds between screen refreshes.
+    #[arg(long, default_value_t = 100)]
+    interval_ms: u64,
 }
 
 #[derive(Debug, Args)]
@@ -106,13 +127,13 @@ struct SendArgs {
     #[arg(default_value = "")]
     text: String,
     /// Append a terminal Enter key (carriage return).
-    #[arg(long)]
+    #[arg(long, short = 'e')]
     enter: bool,
     /// Append Ctrl-C.
-    #[arg(long)]
+    #[arg(long, short = 'c')]
     ctrl_c: bool,
     /// Append Ctrl-D.
-    #[arg(long)]
+    #[arg(long, short = 'd')]
     ctrl_d: bool,
 }
 
@@ -122,7 +143,59 @@ pub fn execute(cli: Cli) -> Result<i32> {
         Commands::Host(args) => host(args),
         Commands::Send(args) => send(args),
         Commands::Screen(args) => screen(args),
+        Commands::Attach(args) => attach(args),
+        Commands::Socket(args) => print_default_socket(args),
     }
+}
+
+fn default_socket() -> PathBuf {
+    default_socket_from(
+        env::var_os("AGENT_CLI_LAB_SOCKET"),
+        env::var_os("XDG_RUNTIME_DIR"),
+        env::var_os("TMPDIR"),
+        env::temp_dir(),
+    )
+}
+
+fn default_socket_from(
+    explicit: Option<OsString>,
+    xdg_runtime_dir: Option<OsString>,
+    tmpdir: Option<OsString>,
+    system_temp: PathBuf,
+) -> PathBuf {
+    if let Some(path) = explicit.filter(|value| !value.is_empty()) {
+        return PathBuf::from(path);
+    }
+    let base = xdg_runtime_dir
+        .or(tmpdir)
+        .map(PathBuf::from)
+        .unwrap_or(system_temp);
+    base.join("agent-cli-lab.sock")
+}
+
+fn prepare_socket_parent(socket: &Path) -> Result<()> {
+    if cfg!(windows) {
+        return Ok(());
+    }
+    if let Some(parent) = socket
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create socket directory {}", parent.display()))?;
+    }
+    Ok(())
+}
+
+fn print_default_socket(args: SocketAliasArgs) -> Result<i32> {
+    let socket = default_socket();
+    if args.path_only {
+        println!("{}", socket.display());
+    } else {
+        println!("default socket: {}", socket.display());
+        println!("override with AGENT_CLI_LAB_SOCKET or --socket PATH");
+    }
+    Ok(0)
 }
 
 fn validate_terminal(args: &TerminalArgs) -> Result<()> {
@@ -255,6 +328,7 @@ fn host(args: HostArgs) -> Result<i32> {
         0,
     )));
     let stopped = Arc::new(AtomicBool::new(false));
+    prepare_socket_parent(&args.socket)?;
     let listener = ipc::bind(&args.socket)?;
     let listener_writer = writer.clone();
     let listener_parser = parser.clone();
@@ -520,6 +594,74 @@ fn screen(args: SocketArgs) -> Result<i32> {
     Ok(0)
 }
 
+fn attach(args: AttachArgs) -> Result<i32> {
+    let socket = args.connection.socket;
+    let interval = Duration::from_millis(args.interval_ms.max(16));
+    let stopped = Arc::new(AtomicBool::new(false));
+    let input_stopped = stopped.clone();
+    let input_socket = socket.clone();
+
+    eprintln!("attached to {}; press Ctrl-] to detach", socket.display());
+    let stdin_is_terminal = io::stdin().is_terminal();
+    let stdout_is_terminal = io::stdout().is_terminal();
+    let _console = conpty::ConsoleModes::enable(stdin_is_terminal, stdout_is_terminal);
+    let _raw_mode = RawModeGuard::new(stdin_is_terminal)?;
+    let mut stdout = io::stdout().lock();
+    let mut last_screen = String::new();
+    render_attached_screen(&socket, &mut stdout, &mut last_screen)?;
+
+    let input_thread = thread::spawn(move || -> Result<()> {
+        let mut stdin = io::stdin().lock();
+        let mut buffer = [0_u8; 1024];
+        while !input_stopped.load(Ordering::Acquire) {
+            let count = stdin.read(&mut buffer).context("failed to read stdin")?;
+            if count == 0 {
+                input_stopped.store(true, Ordering::Release);
+                break;
+            }
+            if let Some(position) = buffer[..count].iter().position(|byte| *byte == 0x1d) {
+                if position > 0 {
+                    request(&input_socket, json!({ "op": "send", "data": &buffer[..position] }))?;
+                }
+                input_stopped.store(true, Ordering::Release);
+                break;
+            }
+            request(&input_socket, json!({ "op": "send", "data": &buffer[..count] }))?;
+        }
+        Ok(())
+    });
+
+    while !stopped.load(Ordering::Acquire) {
+        if let Err(error) = render_attached_screen(&socket, &mut stdout, &mut last_screen) {
+            stopped.store(true, Ordering::Release);
+            if !last_screen.is_empty() {
+                writeln!(stdout)?;
+            }
+            eprintln!("detached: {error:#}");
+            break;
+        }
+        thread::sleep(interval);
+    }
+    stopped.store(true, Ordering::Release);
+    if input_thread.is_finished() {
+        input_thread.join().unwrap()?;
+    }
+    Ok(0)
+}
+
+fn render_attached_screen(socket: &Path, stdout: &mut impl Write, last_screen: &mut String) -> Result<()> {
+    let response = request(socket, json!({ "op": "screen" }))?;
+    if let Some(contents) = response.get("screen").and_then(Value::as_str) {
+        if contents != last_screen {
+            write!(stdout, "\x1b[2J\x1b[H{contents}")?;
+            stdout.flush()?;
+            last_screen.clear();
+            last_screen.push_str(contents);
+        }
+    }
+    Ok(())
+}
+
 fn request(socket: &Path, value: Value) -> Result<Value> {
     let stream = ipc::connect(socket)
         .with_context(|| format!("failed to connect to {}", socket.display()))?;
@@ -611,15 +753,8 @@ mod tests {
 
     #[test]
     fn send_enter_uses_carriage_return() {
-        let cli = Cli::try_parse_from([
-            "lab",
-            "send",
-            "--socket",
-            "/tmp/test.sock",
-            "--enter",
-            "hello",
-        ])
-        .unwrap();
+        let cli =
+            Cli::try_parse_from(["lab", "send", "-s", "/tmp/test.sock", "-e", "hello"]).unwrap();
         match cli.command {
             Commands::Send(args) => {
                 assert_eq!(args.text, "hello");
@@ -630,8 +765,100 @@ mod tests {
     }
 
     #[test]
+    fn resolves_default_socket_precedence() {
+        assert_eq!(
+            default_socket_from(
+                Some(OsString::from("/chosen.sock")),
+                Some(OsString::from("/xdg")),
+                Some(OsString::from("/tmpdir")),
+                PathBuf::from("/system"),
+            ),
+            PathBuf::from("/chosen.sock")
+        );
+        assert_eq!(
+            default_socket_from(
+                Some(OsString::new()),
+                Some(OsString::from("/xdg")),
+                Some(OsString::from("/tmpdir")),
+                PathBuf::from("/system"),
+            ),
+            PathBuf::from("/xdg/agent-cli-lab.sock")
+        );
+        assert_eq!(
+            default_socket_from(
+                None,
+                None,
+                Some(OsString::from("/tmpdir")),
+                PathBuf::from("/system")
+            ),
+            PathBuf::from("/tmpdir/agent-cli-lab.sock")
+        );
+        assert_eq!(
+            default_socket_from(None, None, None, PathBuf::from("/system")),
+            PathBuf::from("/system/agent-cli-lab.sock")
+        );
+    }
+
+    #[test]
+    fn defaults_socket_for_host_and_control_commands() {
+        let cli = Cli::try_parse_from(["lab", "host", "--", "tool"]).unwrap();
+        match cli.command {
+            Commands::Host(args) => assert!(args.socket.ends_with("agent-cli-lab.sock")),
+            _ => panic!("expected host command"),
+        }
+
+        let cli = Cli::try_parse_from(["lab", "send", "hello"]).unwrap();
+        match cli.command {
+            Commands::Send(args) => assert!(args.connection.socket.ends_with("agent-cli-lab.sock")),
+            _ => panic!("expected send command"),
+        }
+
+        let cli = Cli::try_parse_from(["lab", "attach"]).unwrap();
+        match cli.command {
+            Commands::Attach(args) => assert!(args.connection.socket.ends_with("agent-cli-lab.sock")),
+            _ => panic!("expected attach command"),
+        }
+    }
+
+    #[test]
+    fn parses_short_control_flags() {
+        let cli = Cli::try_parse_from(["lab", "send", "-e", "-c", "-d", "hello"]).unwrap();
+        match cli.command {
+            Commands::Send(args) => {
+                assert_eq!(args.text, "hello");
+                assert!(args.enter);
+                assert!(args.ctrl_c);
+                assert!(args.ctrl_d);
+            }
+            _ => panic!("expected send command"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "lab",
+            "host",
+            "-r",
+            "out.jsonl",
+            "-C",
+            "100",
+            "-R",
+            "30",
+            "--",
+            "tool",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Host(args) => {
+                assert_eq!(args.terminal.record, Some(PathBuf::from("out.jsonl")));
+                assert_eq!(args.terminal.cols, 100);
+                assert_eq!(args.terminal.rows, 30);
+            }
+            _ => panic!("expected host command"),
+        }
+    }
+
+    #[test]
     fn requires_a_child_command() {
         assert!(Cli::try_parse_from(["lab", "run"]).is_err());
-        assert!(Cli::try_parse_from(["lab", "host", "--socket", "/tmp/x"]).is_err());
+        assert!(Cli::try_parse_from(["lab", "host"]).is_err());
     }
 }

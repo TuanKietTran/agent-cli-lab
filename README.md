@@ -15,13 +15,14 @@ printf 'answer\n' | agent-cli-lab run -- command
 Start the PTY host as a long-running process, then control it from separate calls:
 
 ```sh
-agent-cli-lab host --socket /tmp/pi.sock --record pi.jsonl -- pi --no-session
-agent-cli-lab send --socket /tmp/pi.sock --enter 'Reply exactly: HELLO'
-agent-cli-lab screen --socket /tmp/pi.sock
-agent-cli-lab send --socket /tmp/pi.sock --enter '/exit'
+agent-cli-lab host -r pi.jsonl -- pi --no-session
+agent-cli-lab send -e 'Reply exactly: HELLO'
+agent-cli-lab screen
+agent-cli-lab attach
+agent-cli-lab send -e '/exit'
 ```
 
-`screen` renders the current ANSI TUI into plain text. `--enter` sends carriage return, matching a real terminal Enter key.
+`screen` renders the current ANSI TUI into plain text. `attach` foregrounds the hosted PTY in the current terminal and forwards keys until Ctrl-]. `--enter`/`-e` sends carriage return, matching a real terminal Enter key.
 
 ## Platforms
 
@@ -32,7 +33,7 @@ Linux, macOS and Windows (native, through ConPTY) are supported. [`.github/workf
 | Linux, macOS | a Unix-domain socket file, removed when the child exits | mode `0600` |
 | Windows | only a name: it is mapped to the named pipe `\\.\pipe\agent-cli-lab-<hash>` and no file is created; the pipe disappears when the host ends | a DACL that allows only the current user |
 
-Use the same `--socket` value (relative paths are relative to the current directory) for `host`, `send` and `screen`. Examples in this repo use `/tmp/pi.sock`; on Windows any path works, for example `C:\Temp\pi.sock`.
+By default `host`, `send` and `screen` use `$AGENT_CLI_LAB_SOCKET`, or `agent-cli-lab.sock` under `$XDG_RUNTIME_DIR`, `$TMPDIR`, or the system temp directory. Override with `--socket PATH`/`-s PATH`; `agent-cli-lab socket -p` prints the resolved default. Short forms include `-r` for `--record`, `-C`/`-R` for `--cols`/`--rows`, and `-e`/`-c`/`-d` for `send --enter`/`--ctrl-c`/`--ctrl-d`. On Windows any path-like name works, for example `C:\Temp\pi.sock`.
 
 On Windows, `run` ends a piped stdin with Ctrl-Z and Enter, because a console ignores Ctrl-D.
 
