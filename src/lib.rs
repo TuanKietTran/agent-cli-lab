@@ -796,6 +796,10 @@ fn open_attach_terminal_impl(exe: &Path, socket: &Path, terminal: Option<&str>) 
                     .arg(format!("--config-file={}", config.display()))
                     .spawn()
                     .context("failed to open Ghostty foreground attach")?;
+                // `foreground` is commonly invoked by a background agent process. Starting
+                // Ghostty directly creates the surface but does not reliably make its app
+                // frontmost, so explicitly activate it after launching the attach window.
+                let _ = Command::new("open").args(["-a", "Ghostty"]).status();
                 return Ok(());
             }
         }
@@ -817,6 +821,9 @@ fn open_attach_terminal_impl(exe: &Path, socket: &Path, terminal: Option<&str>) 
         .arg(&script)
         .spawn()
         .context("failed to open Terminal.app")?;
+    // Ensure the newly opened terminal is surfaced even when this command was launched
+    // without a foreground GUI context.
+    let _ = Command::new("open").args(["-a", "Terminal"]).status();
     Ok(())
 }
 
