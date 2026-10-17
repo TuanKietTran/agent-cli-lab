@@ -674,7 +674,10 @@ pub(crate) fn watch(args: WatchArgs) -> Result<i32> {
     }
     let begun = Instant::now();
     let mut quiet = Quiet::new();
-    let mut previous: Option<(State, u64)> = None;
+    // The last asking or stalled screen that was reported, so that it is reported once however often the
+    // program redraws a clock or a usage meter in between (which flips the state to working and back).
+    let mut reported: Option<(State, u64)> = None;
+    let mut previous_state: Option<State> = None;
     loop {
         let (state, look) = match look(&socket, &mut quiet) {
             Ok(look) => (look.state(args.stalled_ms), look),
@@ -687,30 +690,58 @@ pub(crate) fn watch(args: WatchArgs) -> Result<i32> {
                 },
             ),
         };
-        // A new dialog or a new final screen is a new event even in the same state.
-        let signature = match state {
+        let signature = screen_signature(&look.screen);
+        let mut report = false;
+        match state {
             State::Asking | State::Stalled => {
-                use std::hash::{Hash, Hasher};
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                state::tail_lines(&look.screen, 20).hash(&mut hasher);
-                hasher.finish()
-            }
-            _ => 0,
-        };
-        if previous != Some((state, signature)) {
-            previous = Some((state, signature));
-            if wanted.contains(state.name()) {
-                emit(&args, state, &look, begun);
-                if args.once {
-                    return Ok(0);
+                // A new dialog or a new final screen is a new event even in the same state.
+                if reported != Some((state, signature)) {
+                    reported = Some((state, signature));
+                    report = wanted.contains(state.name());
                 }
             }
+            State::Working => {
+                // Real new output (not just changing digits) makes the next stall a new event.
+                if reported.is_some_and(|(_, last)| last != signature) {
+                    reported = None;
+                }
+                report = previous_state != Some(State::Working) && wanted.contains("working");
+            }
+            State::Gone => {
+                if wanted.contains("gone") {
+                    emit(&args, state, &look, begun);
+                }
+                return Ok(0);
+            }
         }
-        if state == State::Gone {
-            return Ok(0);
+        previous_state = Some(state);
+        if report {
+            emit(&args, state, &look, begun);
+            if args.once {
+                return Ok(0);
+            }
         }
         thread::sleep(Duration::from_millis(args.interval_ms.max(50)));
     }
+}
+
+/// Identifies what a screen says, ignoring digits: a clock, a countdown or a usage meter that keeps
+/// ticking in an idle program must not make the same screen look new.
+fn screen_signature(screen: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let tail: String = state::tail_lines(screen, state::ASKING_WINDOW)
+        .chars()
+        .map(|character| {
+            if character.is_ascii_digit() {
+                '#'
+            } else {
+                character
+            }
+        })
+        .collect();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    tail.hash(&mut hasher);
+    hasher.finish()
 }
 
 pub(crate) fn open(args: OpenArgs) -> Result<i32> {
@@ -873,6 +904,18 @@ mod tests {
         );
         assert_eq!(text_argument("typed", &None).unwrap(), "typed");
         assert!(text_argument("", &Some(directory.path().join("missing.txt"))).is_err());
+    }
+
+    #[test]
+    fn a_ticking_digit_does_not_make_a_screen_new() {
+        let idle = "report done\nusage 12%  resets in 3h17\n";
+        let later = "report done\nusage 13%  resets in 3h16\n";
+        assert_eq!(screen_signature(idle), screen_signature(later));
+        assert_ne!(
+            screen_signature(idle),
+            screen_signature("a new report\nusage 12%  resets in 3h17\n")
+        );
+        assert_ne!(screen_signature(idle), screen_signature(""));
     }
 
     #[test]
