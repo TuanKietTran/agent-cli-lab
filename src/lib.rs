@@ -1,5 +1,10 @@
+mod commands;
 mod conpty;
+mod control;
 mod ipc;
+mod keys;
+mod session;
+mod state;
 
 use std::{
     env,
@@ -10,7 +15,8 @@ use std::{
     process::Command,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc,
     },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -19,7 +25,6 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use clap::{Args, Parser, Subcommand};
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
@@ -54,13 +59,27 @@ enum Commands {
     /// Type text and Enter, wait until the screen stops changing, then print it (send + wait + screen).
     Ask(AskArgs),
     /// Print the current rendered screen of a hosted PTY.
-    Screen(SocketArgs),
+    Screen(ScreenArgs),
     /// Attach this terminal to a hosted PTY.
     Attach(AttachArgs),
     /// Show a hosted PTY in the foreground, opening a terminal when needed.
     Foreground(ForegroundArgs),
     /// Resolve the socket path used by the shorthand commands.
     Socket(SocketAliasArgs),
+    /// Start a hosted program in its own visible window and name the session (spec 007).
+    Open(OpenArgs),
+    /// List the named sessions that are running.
+    List(ListArgs),
+    /// Show whether a session is working, asking or stalled, and its size and age.
+    Status(StatusArgs),
+    /// End a session: stop its program and its host.
+    Stop(StopArgs),
+    /// Send named keys (Enter, Down, Esc, Ctrl-C, Down*3, ...) to a session.
+    Key(KeyArgs),
+    /// Block until the screen is idle, shows a pattern, shows a dialog, or the program exits.
+    Wait(WaitArgs),
+    /// Print an event whenever a session starts asking, stalls, or ends.
+    Watch(WatchArgs),
 }
 
 #[derive(Debug, Args)]
@@ -76,13 +95,23 @@ struct RunArgs {
 struct HostArgs {
     #[command(flatten)]
     terminal: TerminalArgs,
-    /// Local socket used by `send` and `screen`. On Windows this is only a name: it is mapped to
-    /// a named pipe that just the current user can open, and no file is created.
-    #[arg(long, short = 's', value_name = "PATH", default_value_os_t = default_socket())]
-    socket: PathBuf,
+    /// Control socket (`-s`, on Windows only a name mapped to a private named pipe) or a session
+    /// name (`-n`, which also lists the session in `list`).
+    #[command(flatten)]
+    target: SocketArgs,
     /// Also display the TUI and accept keyboard input in this terminal.
     #[arg(long)]
     stdio: bool,
+    /// Title for this terminal window (with --stdio).
+    #[arg(long, value_name = "TEXT")]
+    title: Option<String>,
+    /// Resize this console window to the terminal size (Windows, with --stdio).
+    #[arg(long)]
+    fit_window: bool,
+    /// Keep QuickEdit on in a --stdio window (Windows). Off by default: a click in a QuickEdit
+    /// console starts a selection that freezes the hosted program.
+    #[arg(long)]
+    quick_edit: bool,
     /// Command and arguments. Place these after `--`.
     #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
     command: Vec<OsString>,
@@ -99,13 +128,59 @@ struct TerminalArgs {
     /// Terminal height in rows.
     #[arg(long, short = 'R', default_value_t = 24)]
     rows: u16,
+    /// Directory the program starts in. Defaults to this process's current directory.
+    #[arg(long, value_name = "DIR")]
+    cwd: Option<PathBuf>,
+    /// Environment variable for the program, NAME=VALUE. Repeat for more than one.
+    #[arg(long = "env", value_name = "NAME=VALUE", value_parser = parse_env)]
+    env: Vec<(String, String)>,
 }
 
-#[derive(Debug, Args)]
+fn parse_env(text: &str) -> std::result::Result<(String, String), String> {
+    match text.split_once('=') {
+        Some((name, value)) if !name.is_empty() && !name.contains(['\0', '=']) => {
+            Ok((name.to_owned(), value.to_owned()))
+        }
+        _ => Err("write NAME=VALUE".to_owned()),
+    }
+}
+
+#[derive(Debug, Args, Clone, Default)]
 struct SocketArgs {
     /// Local socket of the running host (the same value that was given to `host`).
-    #[arg(long, short = 's', value_name = "PATH", default_value_os_t = default_socket())]
-    socket: PathBuf,
+    #[arg(long, short = 's', value_name = "PATH", conflicts_with = "name")]
+    socket: Option<PathBuf>,
+    /// Session name given to `host --name` or `open --name`; replaces an absolute socket path.
+    #[arg(long, short = 'n', value_name = "NAME")]
+    name: Option<String>,
+}
+
+impl SocketArgs {
+    /// `-s`, else `-n`, else $AGENT_CLI_LAB_SOCKET, else $AGENT_CLI_LAB_NAME, else the default socket.
+    fn path(&self) -> Result<PathBuf> {
+        self.resolve(
+            env::var_os("AGENT_CLI_LAB_SOCKET").filter(|value| !value.is_empty()),
+            env::var("AGENT_CLI_LAB_NAME")
+                .ok()
+                .filter(|value| !value.is_empty()),
+        )
+    }
+
+    fn resolve(&self, env_socket: Option<OsString>, env_name: Option<String>) -> Result<PathBuf> {
+        if let Some(socket) = &self.socket {
+            return Ok(socket.clone());
+        }
+        if let Some(name) = &self.name {
+            return session::socket_for(name);
+        }
+        if env_socket.is_some() {
+            return Ok(default_socket());
+        }
+        match env_name {
+            Some(name) => session::socket_for(&name),
+            None => Ok(default_socket()),
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -143,19 +218,73 @@ struct ForegroundArgs {
     command: Vec<OsString>,
 }
 
+/// How text is typed into the program (spec 007). Many TUIs read a fast burst of characters as a
+/// paste and swallow the Enter that follows it, so typing can be paced.
+#[derive(Debug, Args, Default)]
+struct TypingArgs {
+    /// Type the way a person would: 50 characters at a time, 150 ms apart, and wait 800 ms before Enter.
+    #[arg(long)]
+    paced: bool,
+    /// Send this many characters at a time (0 sends everything at once).
+    #[arg(long, value_name = "N")]
+    chunk: Option<usize>,
+    /// Pause between chunks, in milliseconds.
+    #[arg(long, value_name = "MS")]
+    pause_ms: Option<u64>,
+    /// Pause before the Enter key, in milliseconds.
+    #[arg(long, value_name = "MS")]
+    enter_delay_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Typing {
+    chunk: usize,
+    pause: Duration,
+    enter_delay: Duration,
+}
+
+impl TypingArgs {
+    fn resolve(&self) -> Typing {
+        let (chunk, pause, enter_delay) = if self.paced {
+            (50, 150, 800)
+        } else {
+            (0, 0, 0)
+        };
+        Typing {
+            chunk: self.chunk.unwrap_or(chunk),
+            pause: Duration::from_millis(self.pause_ms.unwrap_or(pause)),
+            enter_delay: Duration::from_millis(self.enter_delay_ms.unwrap_or(enter_delay)),
+        }
+    }
+}
+
 #[derive(Debug, Args)]
 struct AskArgs {
     #[command(flatten)]
     connection: SocketArgs,
     /// Text to type, followed by Enter. Omit to only wait for the screen to settle.
-    #[arg(default_value = "")]
+    #[arg(default_value = "", conflicts_with = "file")]
     text: String,
+    /// Read the text to type from a file (no shell quoting, any length).
+    #[arg(long, value_name = "PATH")]
+    file: Option<PathBuf>,
+    #[command(flatten)]
+    typing: TypingArgs,
     /// The screen counts as settled after it stays unchanged this many milliseconds.
     #[arg(long, short = 'i', default_value_t = 1500)]
     idle_ms: u64,
-    /// Give up waiting and print the screen after this many seconds.
+    /// Instead of settling, wait until this regular expression matches the screen. Repeatable.
+    #[arg(long, value_name = "REGEX")]
+    until: Vec<String>,
+    /// Instead of settling, wait until a question or permission dialog is showing.
+    #[arg(long)]
+    asking: bool,
+    /// Give up waiting and print the screen after this many seconds (exit status 124).
     #[arg(long, short = 't', default_value_t = 120)]
     timeout: u64,
+    /// Print only the last N non-empty lines of the screen (0 prints all of it).
+    #[arg(long, default_value_t = 0, value_name = "N")]
+    tail: usize,
 }
 
 #[derive(Debug, Args)]
@@ -163,8 +292,21 @@ struct SendArgs {
     #[command(flatten)]
     connection: SocketArgs,
     /// Text to type. Exact UTF-8 bytes are sent.
-    #[arg(default_value = "")]
+    #[arg(default_value = "", conflicts_with = "file")]
     text: String,
+    /// Read the text to type from a file (no shell quoting, any length).
+    #[arg(long, value_name = "PATH")]
+    file: Option<PathBuf>,
+    #[command(flatten)]
+    typing: TypingArgs,
+    /// Named key to press after the text: Enter, Esc, Down, Ctrl-C, Down*3 ... Repeatable, in order.
+    #[arg(
+        long = "key",
+        short = 'k',
+        value_name = "KEY",
+        allow_hyphen_values = true
+    )]
+    keys: Vec<String>,
     /// Append a terminal Enter key (carriage return).
     #[arg(long, short = 'e')]
     enter: bool,
@@ -176,16 +318,176 @@ struct SendArgs {
     ctrl_d: bool,
 }
 
+#[derive(Debug, Args)]
+struct ScreenArgs {
+    #[command(flatten)]
+    connection: SocketArgs,
+    /// Print only the last N non-empty lines.
+    #[arg(long, value_name = "N")]
+    tail: Option<usize>,
+    /// Drop empty lines and trailing spaces.
+    #[arg(long)]
+    compact: bool,
+    /// Print JSON: lines, size, cursor, title and cursor mode; with --spans also the coloured runs.
+    #[arg(long)]
+    json: bool,
+    /// With --json, include runs of cells that are not in the default colours or style. This is how
+    /// grey suggestion text is told from typed text.
+    #[arg(long, requires = "json")]
+    spans: bool,
+}
+
+#[derive(Debug, Args)]
+struct KeyArgs {
+    #[command(flatten)]
+    connection: SocketArgs,
+    /// Keys in order, for example `Down Down Enter`; `Down*3` repeats; a single character is itself.
+    #[arg(required = true, allow_hyphen_values = true, value_name = "KEY")]
+    keys: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct WaitArgs {
+    #[command(flatten)]
+    connection: SocketArgs,
+    /// No output for this many milliseconds.
+    #[arg(long, short = 'i', value_name = "MS")]
+    idle_ms: Option<u64>,
+    /// The screen shows this regular expression. Repeatable: all must match.
+    #[arg(long = "for", short = 'f', value_name = "REGEX")]
+    patterns: Vec<String>,
+    /// A question or permission dialog is showing.
+    #[arg(long)]
+    asking: bool,
+    /// This regular expression is no longer on the screen. Repeatable.
+    #[arg(long, value_name = "REGEX")]
+    gone: Vec<String>,
+    /// Give up after this many seconds (exit status 124).
+    #[arg(long, short = 't', default_value_t = 120)]
+    timeout: u64,
+    /// Print the last N non-empty lines of the screen when done (0 prints all of it).
+    #[arg(long, default_value_t = 12, value_name = "N")]
+    tail: usize,
+    /// Print nothing; the exit status says what happened.
+    #[arg(long, short = 'q')]
+    quiet: bool,
+}
+
+#[derive(Debug, Args)]
+struct WatchArgs {
+    #[command(flatten)]
+    connection: SocketArgs,
+    /// States to report, comma separated: working, asking, stalled, gone.
+    #[arg(long, default_value = "asking,stalled,gone", value_name = "STATES")]
+    only: String,
+    /// A session with no output for this long (and no dialog) is `stalled`.
+    #[arg(long, default_value_t = 8000, value_name = "MS")]
+    stalled_ms: u64,
+    /// Time between looks at the screen.
+    #[arg(long, default_value_t = 1000, value_name = "MS")]
+    interval_ms: u64,
+    /// Lines of the screen to print with an event.
+    #[arg(long, default_value_t = 12, value_name = "N")]
+    tail: usize,
+    /// One JSON object per line instead of text.
+    #[arg(long)]
+    json: bool,
+    /// Exit after the first reported event.
+    #[arg(long)]
+    once: bool,
+}
+
+#[derive(Debug, Args)]
+struct StatusArgs {
+    #[command(flatten)]
+    connection: SocketArgs,
+    /// Print JSON instead of text.
+    #[arg(long)]
+    json: bool,
+    /// A session with no output for this long (and no dialog) is `stalled`.
+    #[arg(long, default_value_t = 8000, value_name = "MS")]
+    stalled_ms: u64,
+}
+
+#[derive(Debug, Args)]
+struct StopArgs {
+    #[command(flatten)]
+    connection: SocketArgs,
+    /// Seconds to wait for the host to go away.
+    #[arg(long, short = 't', default_value_t = 5)]
+    timeout: u64,
+}
+
+#[derive(Debug, Args)]
+struct ListArgs {
+    /// Print JSON instead of a table.
+    #[arg(long)]
+    json: bool,
+    /// Also show registry entries whose host no longer answers (they are removed otherwise).
+    #[arg(long)]
+    all: bool,
+}
+
+#[derive(Debug, Args)]
+struct OpenArgs {
+    /// Session name: `-n NAME` reaches it afterwards. Defaults to `lab-<process id>`.
+    #[arg(long, short = 'n', value_name = "NAME")]
+    name: Option<String>,
+    /// Window title. Defaults to `agent-cli-lab: NAME`.
+    #[arg(long, value_name = "TEXT")]
+    title: Option<String>,
+    /// Terminal width in columns (also the width of the window on Windows).
+    #[arg(long, short = 'C', default_value_t = 150)]
+    cols: u16,
+    /// Terminal height in rows.
+    #[arg(long, short = 'R', default_value_t = 40)]
+    rows: u16,
+    /// Directory the program starts in. Defaults to this process's current directory.
+    #[arg(long, value_name = "DIR")]
+    cwd: Option<PathBuf>,
+    /// Environment variable for the program, NAME=VALUE. Repeatable.
+    #[arg(long = "env", value_name = "NAME=VALUE", value_parser = parse_env)]
+    env: Vec<(String, String)>,
+    /// Write input, output, and exit events as JSON Lines.
+    #[arg(long, short = 'r', value_name = "PATH")]
+    record: Option<PathBuf>,
+    /// Do not open a window: host in the background (control it with send, ask, screen, key, wait).
+    #[arg(long)]
+    detached: bool,
+    /// Keep QuickEdit on in the window (Windows).
+    #[arg(long)]
+    quick_edit: bool,
+    /// Terminal app to open on macOS and Linux. Defaults to $AGENT_CLI_LAB_TERMINAL.
+    #[arg(long, value_name = "NAME")]
+    terminal: Option<String>,
+    /// Seconds to wait until the session answers.
+    #[arg(long, default_value_t = 30, value_name = "S")]
+    timeout: u64,
+    /// Print JSON instead of text.
+    #[arg(long)]
+    json: bool,
+    /// Program and arguments. Place these after `--`.
+    #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+    command: Vec<OsString>,
+}
+
 pub fn execute(cli: Cli) -> Result<i32> {
     match cli.command {
         Commands::Run(args) => run(args),
         Commands::Host(args) => host(args),
-        Commands::Send(args) => send(args),
-        Commands::Ask(args) => ask(args),
-        Commands::Screen(args) => screen(args),
+        Commands::Send(args) => commands::send(args),
+        Commands::Ask(args) => commands::ask(args),
+        Commands::Screen(args) => commands::screen(args),
         Commands::Attach(args) => attach(args),
         Commands::Foreground(args) => foreground(args),
         Commands::Socket(args) => print_default_socket(args),
+        Commands::Open(args) => commands::open(args),
+        Commands::List(args) => commands::list(args),
+        Commands::Status(args) => commands::status(args),
+        Commands::Stop(args) => commands::stop(args),
+        Commands::Key(args) => commands::key(args),
+        Commands::Wait(args) => commands::wait(args),
+        Commands::Watch(args) => commands::watch(args),
     }
 }
 
@@ -285,6 +587,11 @@ impl Pty {
     fn resizer(&self) -> Resizer {
         Arc::downgrade(&self.master)
     }
+
+    /// Ends the child from another thread (the control socket's `stop`).
+    fn killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+        self.child.clone_killer()
+    }
 }
 
 /// The PTY and the writer for its input. Dropping the last reference to the writer makes it send
@@ -299,7 +606,13 @@ fn open_pty(args: &TerminalArgs, child_command: &[OsString]) -> Result<(Pty, Sha
         })
         .context("failed to open pseudo-terminal")?;
     let mut command = CommandBuilder::new(&child_command[0]);
-    command.cwd(std::env::current_dir().context("failed to resolve current directory")?);
+    command.cwd(match &args.cwd {
+        Some(directory) => directory.clone(),
+        None => std::env::current_dir().context("failed to resolve current directory")?,
+    });
+    for (name, value) in &args.env {
+        command.env(name, value);
+    }
     for arg in &child_command[1..] {
         command.arg(arg);
     }
@@ -371,33 +684,88 @@ fn run(args: RunArgs) -> Result<i32> {
 
 fn host(args: HostArgs) -> Result<i32> {
     validate_terminal(&args.terminal)?;
+    if args.stdio {
+        conpty::adopt_own_console();
+    }
+    let socket = args.target.path()?;
     let recorder = create_recorder(&args.terminal, &args.command)?;
     let (pty, writer) = open_pty(&args.terminal, &args.command)?;
     let resizer = pty.resizer();
+    let killer = pty.killer();
     let parser = Arc::new(Mutex::new(vt100::Parser::new(
         args.terminal.rows,
         args.terminal.cols,
         0,
     )));
     let stopped = Arc::new(AtomicBool::new(false));
-    prepare_socket_parent(&args.socket)?;
-    let listener = ipc::bind(&args.socket)?;
-    let listener_writer = writer.clone();
-    let listener_parser = parser.clone();
-    let listener_recorder = recorder.clone();
-    let listener_stopped = stopped.clone();
-    let listener_thread = thread::spawn(move || {
-        serve_socket(
-            listener,
-            listener_writer,
-            listener_parser,
-            resizer,
-            listener_recorder,
-            listener_stopped,
-        )
+    prepare_socket_parent(&socket)?;
+    let listener = ipc::bind(&socket)?;
+
+    let command_words: Vec<String> = args
+        .command
+        .iter()
+        .map(|word| word.to_string_lossy().into_owned())
+        .collect();
+    let working_directory = args
+        .terminal
+        .cwd
+        .clone()
+        .or_else(|| env::current_dir().ok())
+        .map(|path| path.display().to_string());
+    // A named session is listed by `list` for as long as this host runs; the guard removes the entry.
+    let _registration = match &args.target.name {
+        Some(name) => Some(session::register(&session::Entry {
+            name: name.clone(),
+            pid: std::process::id(),
+            socket: socket.display().to_string(),
+            command: command_words.clone(),
+            cwd: working_directory.clone(),
+            title: args.title.clone(),
+            cols: args.terminal.cols,
+            rows: args.terminal.rows,
+            started_ms: now_ms() as u64,
+        })?),
+        None => None,
+    };
+
+    let shared = Arc::new(control::HostShared {
+        writer: writer.clone(),
+        parser: parser.clone(),
+        resizer,
+        recorder: recorder.clone(),
+        stopped: stopped.clone(),
+        activity: Mutex::new(control::Activity {
+            last_output: Instant::now(),
+            bytes: 0,
+        }),
+        exit_code: Mutex::new(None),
+        killer: Mutex::new(killer),
+        info: control::HostInfo {
+            name: args.target.name.clone(),
+            title: args.title.clone(),
+            command: command_words,
+            cwd: working_directory,
+            started_ms: now_ms() as u64,
+            pid: std::process::id(),
+        },
+        started: Instant::now(),
+        handlers: AtomicUsize::new(0),
     });
+    let listener_thread = {
+        let shared = shared.clone();
+        thread::spawn(move || control::serve_socket(listener, shared))
+    };
 
     let stdin_is_terminal = io::stdin().is_terminal();
+    let stdout_is_terminal = io::stdout().is_terminal();
+    if args.stdio {
+        if let Some(title) = &args.title {
+            conpty::set_title(title);
+        }
+        if args.fit_window && stdout_is_terminal {
+            conpty::fit_window(args.terminal.cols, args.terminal.rows);
+        }
+    }
     let _raw_mode = RawModeGuard::new(args.stdio && stdin_is_terminal)?;
     if args.stdio {
         let terminal_writer = writer.clone();
@@ -421,16 +789,29 @@ fn host(args: HostArgs) -> Result<i32> {
         });
     }
 
-    let _console = conpty::ConsoleModes::enable(
+    let (console_input, console_output) = (
         args.stdio && stdin_is_terminal,
-        args.stdio && io::stdout().is_terminal(),
+        args.stdio && stdout_is_terminal,
     );
+    // A window a person watches loses QuickEdit: a click would otherwise start a selection that
+    // freezes the hosted program (spec 007).
+    let _console = if args.stdio && !args.quick_edit {
+        conpty::ConsoleModes::enable_window(console_input, console_output)
+    } else {
+        conpty::ConsoleModes::enable(console_input, console_output)
+    };
 
     let mut stdout = io::stdout().lock();
+    // A title given with --title is not replaced by the one the hosted program sets.
+    let mut title_filter = (args.stdio && args.title.is_some()).then(conpty::TitleFilter::default);
     let code = pty.pump(handshake_input(&writer), |bytes| {
+        shared.note_output(bytes.len());
         parser.lock().unwrap().process(bytes);
         if args.stdio {
-            stdout.write_all(bytes)?;
+            match title_filter.as_mut() {
+                Some(filter) => stdout.write_all(&filter.filter(bytes))?,
+                None => stdout.write_all(bytes)?,
+            }
             stdout.flush()?;
         }
         if let Some(recorder) = &recorder {
@@ -440,6 +821,9 @@ fn host(args: HostArgs) -> Result<i32> {
     })?;
 
     let code = record_exit(recorder, code)?;
+    *shared.exit_code.lock().unwrap() = Some(code);
+    // Keep answering for a moment so that a `wait` or `status` can read the final screen and the exit code.
+    thread::sleep(Duration::from_millis(300));
     stopped.store(true, Ordering::Release);
     let _ = listener_thread.join();
     Ok(code)
@@ -531,189 +915,8 @@ fn record_exit(recorder: Option<Arc<Mutex<Recorder>>>, code: i32) -> Result<i32>
     Ok(code)
 }
 
-#[derive(Debug, Deserialize)]
-struct ControlRequest {
-    op: String,
-    #[serde(default)]
-    data: Vec<u8>,
-    #[serde(default)]
-    rows: u16,
-    #[serde(default)]
-    cols: u16,
-}
-
-#[derive(Debug, Serialize)]
-struct ControlResponse {
-    ok: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    screen: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
-}
-
-fn serve_socket(
-    listener: ipc::Listener,
-    writer: SharedWriter,
-    parser: Arc<Mutex<vt100::Parser>>,
-    resizer: Resizer,
-    recorder: Option<Arc<Mutex<Recorder>>>,
-    stopped: Arc<AtomicBool>,
-) {
-    while !stopped.load(Ordering::Acquire) {
-        match ipc::accept(&listener) {
-            Ok(stream) => {
-                let _ = handle_control(stream, &writer, &parser, &resizer, &recorder);
-            }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(20));
-            }
-            Err(_) => break,
-        }
-    }
-}
-
-fn handle_control(
-    stream: ipc::Stream,
-    writer: &SharedWriter,
-    parser: &Arc<Mutex<vt100::Parser>>,
-    resizer: &Resizer,
-    recorder: &Option<Arc<Mutex<Recorder>>>,
-) -> Result<()> {
-    let mut line = String::new();
-    BufReader::new(&stream).read_line(&mut line)?;
-    let response = match serde_json::from_str::<ControlRequest>(&line) {
-        Ok(request) if request.op == "send" => {
-            let result = (|| -> Result<()> {
-                let mut output = writer.lock().unwrap();
-                output.write_all(&request.data)?;
-                output.flush()?;
-                if let Some(recorder) = recorder {
-                    recorder.lock().unwrap().chunk("input", &request.data)?;
-                }
-                Ok(())
-            })();
-            match result {
-                Ok(()) => ControlResponse {
-                    ok: true,
-                    screen: None,
-                    error: None,
-                },
-                Err(error) => ControlResponse {
-                    ok: false,
-                    screen: None,
-                    error: Some(error.to_string()),
-                },
-            }
-        }
-        Ok(request) if request.op == "screen" => ControlResponse {
-            ok: true,
-            screen: Some(parser.lock().unwrap().screen().contents()),
-            error: None,
-        },
-        Ok(request) if request.op == "screen_ansi" => {
-            let parser = parser.lock().unwrap();
-            let screen = parser.screen();
-            let mut bytes = screen.contents_formatted();
-            let (row, col) = screen.cursor_position();
-            bytes.extend(format!("\x1b[{};{}H", row + 1, col + 1).bytes());
-            bytes.extend(if screen.hide_cursor() { &b"\x1b[?25l"[..] } else { &b"\x1b[?25h"[..] });
-            ControlResponse {
-                ok: true,
-                screen: Some(String::from_utf8_lossy(&bytes).into_owned()),
-                error: None,
-            }
-        }
-        Ok(request) if request.op == "resize" && request.rows > 0 && request.cols > 0 => {
-            let size = PtySize {
-                rows: request.rows,
-                cols: request.cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            };
-            let result = match resizer.upgrade() {
-                Some(master) => master.lock().unwrap().resize(size).map_err(|e| e.to_string()),
-                None => Err("the child has exited".to_string()),
-            };
-            match result {
-                Ok(()) => {
-                    parser.lock().unwrap().set_size(request.rows, request.cols);
-                    ControlResponse { ok: true, screen: None, error: None }
-                }
-                Err(error) => ControlResponse { ok: false, screen: None, error: Some(error) },
-            }
-        }
-        Ok(request) => ControlResponse {
-            ok: false,
-            screen: None,
-            error: Some(format!("unknown operation: {}", request.op)),
-        },
-        Err(error) => ControlResponse {
-            ok: false,
-            screen: None,
-            error: Some(format!("invalid request: {error}")),
-        },
-    };
-    let mut reply = serde_json::to_vec(&response)?;
-    reply.push(b'\n');
-    (&stream).write_all(&reply)?;
-    Ok(())
-}
-
-fn send(args: SendArgs) -> Result<i32> {
-    let mut data = args.text.into_bytes();
-    if args.enter {
-        data.push(0x0d);
-    }
-    if args.ctrl_c {
-        data.push(0x03);
-    }
-    if args.ctrl_d {
-        data.push(0x04);
-    }
-    request(
-        &args.connection.socket,
-        json!({ "op": "send", "data": data }),
-    )?;
-    Ok(0)
-}
-
-/// Sends `text` plus Enter, then polls until the screen has not changed for `idle_ms`.
-fn ask(args: AskArgs) -> Result<i32> {
-    if !args.text.is_empty() {
-        let mut data = args.text.into_bytes();
-        data.push(b'\r');
-        request(&args.connection.socket, json!({ "op": "send", "data": data }))?;
-    }
-    let poll = Duration::from_millis(100);
-    let idle = Duration::from_millis(args.idle_ms);
-    let deadline = Instant::now() + Duration::from_secs(args.timeout);
-    let mut last = String::new();
-    let mut changed = Instant::now();
-    loop {
-        let response = request(&args.connection.socket, json!({ "op": "screen" }))?;
-        let current = response.get("screen").and_then(Value::as_str).unwrap_or_default();
-        if current != last {
-            last = current.to_owned();
-            changed = Instant::now();
-        }
-        if changed.elapsed() >= idle || Instant::now() >= deadline {
-            println!("{last}");
-            return Ok(0);
-        }
-        thread::sleep(poll);
-    }
-}
-
-fn screen(args: SocketArgs) -> Result<i32> {
-    let response = request(&args.socket, json!({ "op": "screen" }))?;
-    if let Some(contents) = response.get("screen").and_then(Value::as_str) {
-        println!("{contents}");
-    }
-    Ok(0)
-}
-
 fn foreground(args: ForegroundArgs) -> Result<i32> {
-    let socket = args.attach.connection.socket.clone();
+    let socket = args.attach.connection.path()?;
     if !args.command.is_empty() {
         host_detached(&socket, args.cols, args.rows, &args.command)?;
     }
@@ -743,6 +946,7 @@ fn host_detached(socket: &Path, cols: u16, rows: u16, command: &[OsString]) -> R
         .stderr(std::process::Stdio::null());
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut host, 0);
+    conpty::stop_inheriting_std_handles();
     host.spawn().context("failed to start host")?;
     for _ in 0..50 {
         if request(socket, json!({ "op": "screen" })).is_ok() {
@@ -803,11 +1007,16 @@ fn open_attach_terminal_impl(exe: &Path, socket: &Path, terminal: Option<&str>) 
                 return Ok(());
             }
         }
-        return Err(anyhow!("Ghostty was requested but no Ghostty executable was found"));
+        return Err(anyhow!(
+            "Ghostty was requested but no Ghostty executable was found"
+        ));
     }
 
     // Terminal.app fallback: it opens executable .command files.
-    let script = env::temp_dir().join(format!("agent-cli-lab-attach-{}.command", std::process::id()));
+    let script = env::temp_dir().join(format!(
+        "agent-cli-lab-attach-{}.command",
+        std::process::id()
+    ));
     let body = format!(
         "#!/bin/sh\nexec {} attach -s {}\n",
         shell_quote(&exe.to_string_lossy()),
@@ -848,30 +1057,45 @@ fn open_attach_terminal_impl(exe: &Path, socket: &Path, terminal: Option<&str>) 
     ];
     for (program, prefix) in candidates {
         let mut command = Command::new(program);
-        command.args(*prefix).arg(exe).arg("attach").arg("-s").arg(socket);
+        command
+            .args(*prefix)
+            .arg(exe)
+            .arg("attach")
+            .arg("-s")
+            .arg(socket);
         if command.spawn().is_ok() {
             return Ok(());
         }
     }
-    Err(anyhow!("failed to find a terminal emulator for foreground attach"))
+    Err(anyhow!(
+        "failed to find a terminal emulator for foreground attach"
+    ))
 }
 
 #[cfg(windows)]
 fn open_attach_terminal_impl(exe: &Path, socket: &Path, terminal: Option<&str>) -> Result<()> {
     Command::new(terminal.unwrap_or("cmd"))
-        .args(["/C", "start", "", &exe.to_string_lossy(), "attach", "-s", &socket.to_string_lossy()])
+        .args([
+            "/C",
+            "start",
+            "",
+            &exe.to_string_lossy(),
+            "attach",
+            "-s",
+            &socket.to_string_lossy(),
+        ])
         .spawn()
         .context("failed to open a Windows Terminal window")?;
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn attach(args: AttachArgs) -> Result<i32> {
-    let socket = args.connection.socket;
+    let socket = args.connection.path()?;
     let interval = Duration::from_millis(args.interval_ms.max(16));
     let stopped = Arc::new(AtomicBool::new(false));
     let input_stopped = stopped.clone();
@@ -885,7 +1109,8 @@ fn attach(args: AttachArgs) -> Result<i32> {
     }
     eprintln!("attached to {}; press Ctrl-] to detach", socket.display());
     let stdout_is_terminal = io::stdout().is_terminal();
-    let _console = conpty::ConsoleModes::enable(true, stdout_is_terminal);
+    // A window a person watches: QuickEdit off, so a click cannot freeze the attach (spec 007).
+    let _console = conpty::ConsoleModes::enable_window(true, stdout_is_terminal);
     let _raw_mode = RawModeGuard::new(true)?;
     let mut stdout = io::stdout().lock();
     let mut last_screen = String::new();
@@ -946,7 +1171,10 @@ fn sync_attached_size(socket: &Path, last: Option<(u16, u16)>) -> Option<(u16, u
         return last;
     }
     let (cols, rows) = current;
-    match request(socket, json!({ "op": "resize", "cols": cols, "rows": rows })) {
+    match request(
+        socket,
+        json!({ "op": "resize", "cols": cols, "rows": rows }),
+    ) {
         Ok(_) => Some(current),
         Err(_) => last,
     }
@@ -966,10 +1194,17 @@ fn render_attached_screen(
     }
     if let Some(contents) = response.get("screen").and_then(Value::as_str) {
         let legacy_text = contents.replace('\n', "\r\n");
-        let contents = if legacy { legacy_text.as_str() } else { contents };
+        let contents = if legacy {
+            legacy_text.as_str()
+        } else {
+            contents
+        };
         if contents != last_screen {
             // Synchronized update, home, clear, then the formatted cells, cursor and visibility.
-            write!(stdout, "\x1b[?2026h\x1b[?25l\x1b[H\x1b[2J{contents}\x1b[?2026l")?;
+            write!(
+                stdout,
+                "\x1b[?2026h\x1b[?25l\x1b[H\x1b[2J{contents}\x1b[?2026l"
+            )?;
             stdout.flush()?;
             last_screen.clear();
             last_screen.push_str(contents);
@@ -989,13 +1224,17 @@ fn request(socket: &Path, value: Value) -> Result<Value> {
     BufReader::new(&stream).read_line(&mut line)?;
     let response: Value = serde_json::from_str(&line).context("invalid host response")?;
     if !response.get("ok").and_then(Value::as_bool).unwrap_or(false) {
-        return Err(anyhow!(
-            "host rejected request: {}",
-            response
-                .get("error")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown error")
-        ));
+        let message = response
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown error");
+        if message.starts_with("unknown operation") {
+            // A host from before the operation existed: callers fall back (spec 007).
+            return Err(anyhow::Error::new(commands::UnknownOperation(
+                message.to_owned(),
+            )));
+        }
+        return Err(anyhow!("host rejected request: {message}"));
     }
     Ok(response)
 }
@@ -1119,20 +1358,35 @@ mod tests {
     fn defaults_socket_for_host_and_control_commands() {
         let cli = Cli::try_parse_from(["lab", "host", "--", "tool"]).unwrap();
         match cli.command {
-            Commands::Host(args) => assert!(args.socket.ends_with("agent-cli-lab.sock")),
+            Commands::Host(args) => assert!(
+                args.target
+                    .resolve(None, None)
+                    .unwrap()
+                    .ends_with("agent-cli-lab.sock")
+            ),
             _ => panic!("expected host command"),
         }
 
         let cli = Cli::try_parse_from(["lab", "send", "hello"]).unwrap();
         match cli.command {
-            Commands::Send(args) => assert!(args.connection.socket.ends_with("agent-cli-lab.sock")),
+            Commands::Send(args) => assert!(
+                args.connection
+                    .resolve(None, None)
+                    .unwrap()
+                    .ends_with("agent-cli-lab.sock")
+            ),
             _ => panic!("expected send command"),
         }
 
         let cli = Cli::try_parse_from(["lab", "attach"]).unwrap();
         match cli.command {
             Commands::Attach(args) => {
-                assert!(args.connection.socket.ends_with("agent-cli-lab.sock"))
+                assert!(
+                    args.connection
+                        .resolve(None, None)
+                        .unwrap()
+                        .ends_with("agent-cli-lab.sock")
+                )
             }
             _ => panic!("expected attach command"),
         }
