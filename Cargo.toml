@@ -1,9 +1,14 @@
 [package]
 name = "agent-cli-lab"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
+rust-version = "1.85"
 description = "Run and test interactive CLI programs through a PTY-friendly proxy"
 license = "MIT"
+repository = "https://github.com/TuanKietTran/agent-cli-lab"
+readme = "README.md"
+keywords = ["pty", "terminal", "cli", "testing", "agents"]
+categories = ["command-line-utilities", "development-tools::testing"]
 
 [dependencies]
 anyhow = "1.0"

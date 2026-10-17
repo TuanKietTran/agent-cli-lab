@@ -2,6 +2,16 @@
 
 A small Rust CLI for agents and humans to run another command inside a pseudo-terminal (PTY), interact with it, and optionally save a machine-readable session transcript.
 
+## Install
+
+The crate is published on GitHub, not on crates.io. Install a tagged release from source (needs Rust 1.85 or newer):
+
+```sh
+cargo install --git https://github.com/TuanKietTran/agent-cli-lab --tag v0.2.0 --locked
+```
+
+Each release also carries the packaged `agent-cli-lab-<version>.crate` (a gzipped tarball of the sources) on its GitHub Releases page. On Windows, `cargo install` cannot overwrite an `agent-cli-lab.exe` that is still hosting a window: end those sessions first.
+
 ## Direct interactive proxy
 
 ```sh
