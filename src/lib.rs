@@ -5,6 +5,8 @@ mod ipc;
 mod keys;
 mod session;
 mod state;
+#[cfg(windows)]
+mod windows_killer;
 
 use std::{
     env,
@@ -589,8 +591,16 @@ impl Pty {
     }
 
     /// Ends the child from another thread (the control socket's `stop`).
-    fn killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
-        self.child.clone_killer()
+    fn killer(&self) -> Result<Box<dyn portable_pty::ChildKiller + Send + Sync>> {
+        #[cfg(windows)]
+        {
+            windows_killer::clone_killer(&*self.child)
+                .context("failed to clone the child process handle")
+        }
+        #[cfg(not(windows))]
+        {
+            Ok(self.child.clone_killer())
+        }
     }
 }
 
@@ -691,7 +701,7 @@ fn host(args: HostArgs) -> Result<i32> {
     let recorder = create_recorder(&args.terminal, &args.command)?;
     let (pty, writer) = open_pty(&args.terminal, &args.command)?;
     let resizer = pty.resizer();
-    let killer = pty.killer();
+    let killer = pty.killer()?;
     let parser = Arc::new(Mutex::new(vt100::Parser::new(
         args.terminal.rows,
         args.terminal.cols,

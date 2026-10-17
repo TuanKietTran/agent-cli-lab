@@ -375,10 +375,6 @@ fn op_stop(shared: &HostShared) -> Value {
     // The host ends when its program does; killing the program is all that is needed.
     match shared.killer.lock().unwrap().kill() {
         Ok(()) => ok(),
-        // portable-pty's Windows `kill` checks the result of TerminateProcess the wrong way round: when
-        // the program is ended it returns an error whose OS code is 0 ("The operation completed
-        // successfully"). That is a success.
-        Err(error) if error.raw_os_error() == Some(0) => ok(),
         // Already gone is what the caller wanted.
         Err(_) if shared.exit_code().is_some() => ok(),
         Err(error) => failure(format!("failed to stop the program: {error}")),
